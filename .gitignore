@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+tmp/
+.env
+.env.local
+.env.*.local
+server/storage/*
+!server/storage/uploads/
+!server/storage/outputs/
+server/storage/uploads/*
+server/storage/outputs/*
+!server/storage/uploads/.gitkeep
+!server/storage/outputs/.gitkeep
+npm-debug.log*
+.DS_Store

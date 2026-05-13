@@ -1,0 +1,2233 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import request from 'supertest';
+import bcrypt from 'bcryptjs';
+import sharp from 'sharp';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { createApp } from '../server/app.js';
+import { all, get, insert, run } from '../server/db/database.js';
+import { ensureAdmin, seed } from '../server/db/seeders.js';
+import { creditService } from '../server/services/CreditService.js';
+import { config, warnForProductionConfig } from '../server/config/index.js';
+import { resolveAIProvider } from '../server/services/AIProviderFactory.js';
+import { OpenAIProvider } from '../server/services/OpenAIProvider.js';
+import { GeminiProvider } from '../server/services/providers/GeminiProvider.js';
+import { ClaudeProvider } from '../server/services/providers/ClaudeProvider.js';
+import {
+  getAvailableCapabilities,
+  listProviders,
+  pingProvider,
+  validateProviderConfig,
+} from '../server/services/AIProviderRegistry.js';
+import { renderPromptByKey, renderTemplateString } from '../server/services/PromptRenderer.js';
+import {
+  buildObjectStorageConfig,
+  LocalStorageAdapter,
+  ObjectStorageAdapter,
+  resolveStoragePath,
+} from '../server/services/StorageService.js';
+import { queueService } from '../server/services/QueueService.js';
+import { buildBannerPrompt } from '../server/services/BannerPromptBuilder.js';
+import { buildOutputFilename, postProcessImage } from '../server/services/ImagePostProcessor.js';
+import { GenerateTaskJob } from '../server/jobs/GenerateTaskJob.js';
+import { formatSmokeError, parseSmokeEnv, runSmokeTest, verifyOutputUrls } from '../server/services/SmokeTestRunner.js';
+import { formatStorageCheck, runStorageCheck } from '../server/services/StorageDiagnostics.js';
+import { runEnvDiagnostics } from '../server/services/EnvDiagnostics.js';
+import { adminStorageSummary, getAdminTaskDetail, safeRawResponse } from '../server/services/AdminService.js';
+import { runQualityReview } from '../server/services/QualityReview.js';
+import { classifyTaskError } from '../server/services/TaskFailurePolicy.js';
+import { recoverStuckTasks } from '../server/services/TaskRecoveryService.js';
+import { runLocalCleanup } from '../server/services/CleanupService.js';
+import { runDevReset } from '../server/services/DevResetService.js';
+import { exportDemoData } from '../server/services/DemoExportService.js';
+import { hashDevPilotApiKey } from '../server/services/DevPilotExternalKeyService.js';
+import { listAssets } from '../server/services/AssetService.js';
+import { listAuditLogs } from '../server/services/AuditService.js';
+import { resetExternalApiRateLimits } from '../server/services/ExternalApiRateLimiter.js';
+import { runRcLocalDiagnostics } from '../server/services/RcLocalDiagnostics.js';
+import { readAiPingLastReport, runAiPing } from '../server/services/AiPingDiagnostics.js';
+import { imageLoadErrorMessage, parseTaskCostMeta } from '../src/lib/taskMeta.js';
+
+const png = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p94AAAAASUVORK5CYII=',
+  'base64',
+);
+
+let app;
+
+beforeEach(async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-test-'));
+  app = await createApp({ dbPath: path.join(dir, 'database.sqlite') });
+});
+
+async function csrf(agent) {
+  const response = await agent.get('/api/session');
+  return response.body.csrfToken;
+}
+
+async function register(agent, email = `user-${Date.now()}@example.com`) {
+  const token = await csrf(agent);
+  const response = await agent
+    .post('/api/auth/register')
+    .set('x-csrf-token', token)
+    .send({ name: 'Test User', email, password: 'password123', terms: true });
+  expect(response.status).toBe(201);
+  return { user: response.body.user, token };
+}
+
+async function createBannerTask(agent, token, overrides = {}) {
+  const bootstrap = await agent.get('/api/bootstrap');
+  const format = bootstrap.body.platformFormats.find((item) => item.platform_key === 'facebook');
+  let req = agent
+    .post('/studio/tasks')
+    .set('x-csrf-token', token)
+    .field('tool_type', 'banner')
+    .field('style_key', 'minimal')
+    .field('text_mode', 'merged')
+    .field('image_size', overrides.image_size || '2K')
+    .field('quantity', String(overrides.quantity || 1))
+    .field('product_name', '測試商品')
+    .field('main_title', '測試主標')
+    .field('subtitle', '測試副標')
+    .field('custom_prompt', overrides.custom_prompt || '乾淨背景')
+    .field('platform_format_ids', JSON.stringify(overrides.platform_format_ids ?? [format.id]))
+    .field('custom_formats', JSON.stringify(overrides.custom_formats ?? []))
+    .field('input_roles', JSON.stringify(['cover']));
+
+  if ('credits_cost' in overrides) {
+    req = req.field('credits_cost', String(overrides.credits_cost));
+  }
+  if ('provider' in overrides) req = req.field('provider', overrides.provider);
+  if ('model' in overrides) req = req.field('model', overrides.model);
+  if ('capability' in overrides) req = req.field('capability', overrides.capability);
+  if ('strict_provider' in overrides) req = req.field('strict_provider', String(overrides.strict_provider));
+  if ('quality_review_required' in overrides) req = req.field('quality_review_required', String(overrides.quality_review_required));
+
+  return req.attach('images', png, { filename: 'product.png', contentType: 'image/png' });
+}
+
+async function waitFor(predicate, timeout = 800) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  return false;
+}
+
+async function makeImage(width = 1024, height = 1024, color = '#facc15') {
+  return sharp({
+    create: {
+      width,
+      height,
+      channels: 4,
+      background: color,
+    },
+  })
+    .png()
+    .toBuffer();
+}
+
+function jsonResponse(body, status = 200, headers = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
+  });
+}
+
+function textResponse(body, status = 200) {
+  return new Response(body, { status });
+}
+
+describe('AI commerce generator MVP', () => {
+  it('註冊成功贈送 15 點', async () => {
+    const agent = request.agent(app);
+    const { user } = await register(agent);
+    expect(user.credits_balance).toBe(config.freeCreditsOnSignup);
+  });
+
+  it('credit_transactions 有 grant 紀錄', async () => {
+    const agent = request.agent(app);
+    const { user } = await register(agent);
+    const tx = get('SELECT * FROM credit_transactions WHERE user_id = ? AND type = ?', [user.id, 'grant']);
+    expect(tx.amount).toBe(config.freeCreditsOnSignup);
+    expect(tx.balance_after).toBe(config.freeCreditsOnSignup);
+  });
+
+  it('未登入不能建立任務', async () => {
+    const agent = request.agent(app);
+    const token = await csrf(agent);
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(401);
+  });
+
+  it('點數不足不能建立任務', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent);
+    run('UPDATE users SET credits_balance = 0 WHERE id = ?', [user.id]);
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(422);
+    expect(response.body.message).toContain('1');
+  });
+
+  it('banner 沒選尺寸不能建立任務', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent);
+    const response = await createBannerTask(agent, token, { platform_format_ids: [] });
+    expect(response.status).toBe(422);
+    expect(response.body.message).toContain('尺寸');
+  });
+
+  it('成功建立任務會扣點', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent);
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(config.freeCreditsOnSignup);
+    const consume = get('SELECT * FROM credit_transactions WHERE user_id = ? AND type = ?', [user.id, 'consume']);
+    expect(consume.amount).toBe(0);
+  });
+
+  it('任務建立後會建立 task_images', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent);
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    const images = all('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'input']);
+    expect(images).toHaveLength(1);
+  });
+
+  it('使用者不能看別人的任務', async () => {
+    const owner = request.agent(app);
+    const guest = request.agent(app);
+    const { token } = await register(owner, 'owner@example.com');
+    const task = await createBannerTask(owner, token);
+    await register(guest, 'guest@example.com');
+    const response = await guest.get(`/api/tasks/${task.body.task_id}`);
+    expect(response.status).toBe(403);
+  });
+
+  it('admin 可以看所有任務', async () => {
+    const owner = request.agent(app);
+    const admin = request.agent(app);
+    const { token } = await register(owner, 'owner-admin-test@example.com');
+    const task = await createBannerTask(owner, token);
+    const adminSession = await register(admin, 'admin@example.com');
+    run("UPDATE users SET role = 'admin' WHERE id = ?", [adminSession.user.id]);
+    const response = await admin.get(`/api/tasks/${task.body.task_id}`);
+    expect(response.status).toBe(200);
+    expect(response.body.task.id).toBe(task.body.task_id);
+  });
+
+  it('失敗退點不會重複退', async () => {
+    const previousFakeCost = config.fakeTaskCost;
+    config.fakeTaskCost = 15;
+    const agent = request.agent(app);
+    const { user, token } = await register(agent);
+    const response = await createBannerTask(agent, token, { custom_prompt: '__FAKE_FAIL__' });
+    expect(response.status).toBe(201);
+    const taskId = response.body.task_id;
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [taskId])?.status === 'failed');
+    creditService.refundFailedTask(taskId, 'manual duplicate call');
+    const refreshed = get('SELECT credits_balance FROM users WHERE id = ?', [user.id]);
+    const refunds = all('SELECT * FROM credit_transactions WHERE user_id = ? AND type = ?', [user.id, 'refund']);
+    expect(refreshed.credits_balance).toBe(config.freeCreditsOnSignup);
+    expect(refunds).toHaveLength(1);
+    config.fakeTaskCost = previousFakeCost;
+  });
+
+  it('Seeder 可重複執行不重複', async () => {
+    const before = get('SELECT COUNT(*) AS count FROM style_presets').count;
+    await seed();
+    await seed();
+    const after = get('SELECT COUNT(*) AS count FROM style_presets').count;
+    expect(after).toBe(before);
+    expect(get('SELECT COUNT(*) AS count FROM platform_formats').count).toBe(36);
+  });
+
+  it('does not expose another user assets', async () => {
+    const owner = request.agent(app);
+    const guest = request.agent(app);
+    const { token } = await register(owner, 'asset-owner@example.com');
+    const task = await createBannerTask(owner, token);
+    expect(task.status).toBe(201);
+    await register(guest, 'asset-guest@example.com');
+
+    const response = await guest.get('/api/assets');
+    expect(response.status).toBe(200);
+    expect(response.body.assets.some((asset) => asset.task_id === task.body.task_id)).toBe(false);
+  });
+
+  it('recalculates credits_cost on the backend', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent);
+    const response = await createBannerTask(agent, token, { credits_cost: 0 });
+
+    expect(response.status).toBe(201);
+    expect(response.body.credits_cost).toBe(config.fakeTaskCost);
+    expect(get('SELECT credits_cost FROM generation_tasks WHERE id = ?', [response.body.task_id]).credits_cost).toBe(config.fakeTaskCost);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(config.freeCreditsOnSignup);
+  });
+
+  it('rejects invalid upload formats', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent);
+    const bootstrap = await agent.get('/api/bootstrap');
+    const format = bootstrap.body.platformFormats.find((item) => item.platform_key === 'facebook');
+
+    const response = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'banner')
+      .field('style_key', 'minimal')
+      .field('text_mode', 'merged')
+      .field('platform_format_ids', JSON.stringify([format.id]))
+      .field('input_roles', JSON.stringify(['cover']))
+      .attach('images', Buffer.from('not an image'), { filename: 'bad.txt', contentType: 'text/plain' });
+
+    expect(response.status).toBe(422);
+  });
+
+  it('persists selected platform and custom formats', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent);
+    run('UPDATE users SET credits_balance = 100 WHERE id = ?', [user.id]);
+    const bootstrap = await agent.get('/api/bootstrap');
+    const format = bootstrap.body.platformFormats.find((item) => item.platform_key === 'facebook');
+    const response = await createBannerTask(agent, token, {
+      platform_format_ids: [format.id],
+      custom_formats: [{ width: 1200, height: 630 }],
+    });
+
+    expect(response.status).toBe(201);
+    const formats = all('SELECT * FROM task_formats WHERE task_id = ?', [response.body.task_id]);
+    expect(formats).toHaveLength(2);
+    expect(formats.some((row) => row.platform_format_id === format.id)).toBe(true);
+    expect(formats.some((row) => row.custom_width === 1200 && row.custom_height === 630)).toBe(true);
+  });
+
+  it('writes ai_cost_logs after FakeAIProvider completes', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent);
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'success');
+
+    const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ?', [response.body.task_id]);
+    const raw = JSON.parse(log.raw_response_json);
+    expect(log.provider).toBe('fake');
+    expect(log.model).toBe('fake');
+    expect(log.cost_usd).toBe(0);
+    expect(raw.latency_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it('make-admin promotes an existing user without duplicating email', async () => {
+    const agent = request.agent(app);
+    const { user } = await register(agent, 'promote-me@example.com');
+    const passwordHash = await bcrypt.hash('new-password123', 10);
+
+    const id = ensureAdmin('promote-me@example.com', passwordHash, 'Promoted Admin');
+
+    expect(id).toBe(user.id);
+    expect(get("SELECT COUNT(*) AS count FROM users WHERE email = 'promote-me@example.com'").count).toBe(1);
+    expect(get('SELECT role FROM users WHERE id = ?', [user.id]).role).toBe('admin');
+  });
+
+  it('seeded quick admin can login with admin / 1234', async () => {
+    const agent = request.agent(app);
+    const token = await csrf(agent);
+    const response = await agent
+      .post('/api/auth/login')
+      .set('x-csrf-token', token)
+      .send({ email: 'admin', password: '1234' });
+    expect(response.status).toBe(200);
+    expect(response.body.user.email).toBe('admin');
+    expect(response.body.user.role).toBe('admin');
+  });
+
+  it('dev-pay is restricted to local or admin users', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-non-local-test-'));
+    app = await createApp({ dbPath: path.join(dir, 'database.sqlite'), isLocal: false });
+    const buyer = request.agent(app);
+    const admin = request.agent(app);
+    const { token: buyerToken } = await register(buyer, 'buyer@example.com');
+    const pkg = (await buyer.get('/api/pricing')).body.packages[0];
+    const order = await buyer
+      .post('/api/orders')
+      .set('x-csrf-token', buyerToken)
+      .send({ credit_package_id: pkg.id });
+    expect(order.status).toBe(201);
+
+    const forbidden = await buyer.post(order.body.dev_pay_url).set('x-csrf-token', buyerToken);
+    expect(forbidden.status).toBe(403);
+
+    const adminSession = await register(admin, 'pay-admin@example.com');
+    run("UPDATE users SET role = 'admin' WHERE id = ?", [adminSession.user.id]);
+    const paid = await admin.post(order.body.dev_pay_url).set('x-csrf-token', adminSession.token);
+    expect(paid.status).toBe(200);
+    expect(paid.body.order.status).toBe('paid');
+  });
+
+  it('covers the demo back-office flow after a successful task', async () => {
+    const userAgent = request.agent(app);
+    const adminAgent = request.agent(app);
+    const { user, token } = await register(userAgent, 'demo-flow@example.com');
+    const taskResponse = await createBannerTask(userAgent, token);
+    expect(taskResponse.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [taskResponse.body.task_id])?.status === 'success');
+
+    const dashboard = await userAgent.get('/api/dashboard');
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.recentTasks.some((task) => task.id === taskResponse.body.task_id)).toBe(true);
+
+    const tasks = await userAgent.get('/api/my/tasks');
+    expect(tasks.body.tasks.some((task) => task.id === taskResponse.body.task_id)).toBe(true);
+
+    const assets = await userAgent.get('/api/assets');
+    expect(assets.body.assets.some((asset) => asset.task_id === taskResponse.body.task_id && asset.type === 'input')).toBe(true);
+    expect(assets.body.assets.some((asset) => asset.task_id === taskResponse.body.task_id && asset.type === 'output')).toBe(true);
+
+    const credits = await userAgent.get('/api/credits');
+    expect(credits.body.transactions.some((tx) => tx.type === 'consume' && tx.related_task_id === taskResponse.body.task_id)).toBe(true);
+
+    const adminSession = await register(adminAgent, 'demo-admin@example.com');
+    run("UPDATE users SET role = 'admin' WHERE id = ?", [adminSession.user.id]);
+
+    const users = await adminAgent.get('/api/admin/users?q=demo-flow');
+    expect(users.body.users.some((row) => row.id === user.id)).toBe(true);
+
+    const adjust = await adminAgent
+      .post(`/api/admin/users/${user.id}/adjust-credits`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ amount: 20, note: 'demo flow top up' });
+    expect(adjust.status).toBe(200);
+    expect(adjust.body.user.credits_balance).toBe(config.freeCreditsOnSignup + 20);
+
+    const adminTasks = await adminAgent.get('/api/admin/tasks');
+    expect(adminTasks.body.tasks.some((task) => task.id === taskResponse.body.task_id)).toBe(true);
+  });
+
+  it('AI_PROVIDER=fake resolves the fake provider', async () => {
+    const provider = resolveAIProvider('fake');
+    const result = await provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png' }], 'zh-TW');
+    expect(provider.providerName).toBe('fake');
+    expect(result.imageRoles[0]).toBe('cover');
+  });
+
+  it('provider registry lists safe provider metadata and capabilities', async () => {
+    const providers = listProviders({
+      ...config,
+      openaiApiKey: 'sk-secret-value',
+      geminiApiKey: 'gemini-secret-value',
+      claudeApiKey: '',
+      externalAiBaseUrl: 'https://external.test',
+      externalAiApiKey: 'external-secret-value',
+      devpilotGatewayBaseUrl: 'https://gateway.test',
+      devpilotGatewayApiKey: 'gateway-secret-value',
+      geminiModel: 'gemini-1.5-flash',
+    });
+    expect(providers.map((provider) => provider.name)).toEqual(
+      expect.arrayContaining(['fake', 'openai', 'gemini', 'claude', 'external', 'devpilot-gateway']),
+    );
+    expect(providers.find((provider) => provider.name === 'gemini').capabilities).toEqual(
+      expect.arrayContaining(['summary', 'classification', 'rewrite', 'extraction', 'planning', 'chat', 'generate', 'image_generation']),
+    );
+    const serialized = JSON.stringify(providers);
+    expect(serialized).not.toContain('secret-value');
+    expect(serialized).not.toContain('apiKey');
+    expect(getAvailableCapabilities('claude')).toContain('prompt_rewrite');
+  });
+
+  it('provider registry validates config and factory resolves new provider scaffolds', async () => {
+    expect(resolveAIProvider('gemini').providerName).toBe('gemini');
+    expect(resolveAIProvider('claude').providerName).toBe('claude');
+    expect(resolveAIProvider('devpilot-gateway').providerName).toBe('devpilot-gateway');
+
+    const invalidGemini = validateProviderConfig('gemini', { ...config, geminiApiKey: '' });
+    expect(invalidGemini.ok).toBe(false);
+    expect(invalidGemini.checks[0].message).toContain('not configured');
+
+    const validGeminiPing = await pingProvider('gemini', {}, { ...config, geminiApiKey: 'gemini-secret', geminiModel: 'gemini-1.5-flash' });
+    expect(validGeminiPing.ok).toBe(true);
+    expect(validGeminiPing.live).toBe(false);
+    expect(JSON.stringify(validGeminiPing)).not.toContain('gemini-secret');
+  });
+
+  it('GeminiProvider analyze parses mocked JSON and redacts inline image data', async () => {
+    const previousKey = config.geminiApiKey;
+    const previousModel = config.geminiModel;
+    config.geminiApiKey = 'gemini-secret';
+    config.geminiModel = 'gemini-1.5-flash';
+    const fetchImpl = async (_url, options) => {
+      expect(options.headers['x-goog-api-key']).toBe('gemini-secret');
+      const body = JSON.parse(options.body);
+      expect(body.contents[0].parts[1].inline_data.data).toBeTruthy();
+      return new Response(JSON.stringify({
+        candidates: [{
+          content: {
+            parts: [{ text: JSON.stringify({
+              productName: 'Gemini Product',
+              title: 'Gemini Title',
+              subtitle: 'Gemini Subtitle',
+              customPrompt: 'Gemini clean ad scene',
+              imageRoles: ['cover'],
+            }) }],
+          },
+        }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 8, totalTokenCount: 18 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = new GeminiProvider({ fetchImpl });
+    const result = await provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png', originalname: 'product.png' }], 'zh-TW');
+    expect(result.productName).toBe('Gemini Product');
+    expect(result._meta.provider).toBe('gemini');
+    expect(JSON.stringify(result._meta.raw_response_json)).not.toContain(png.toString('base64'));
+    config.geminiApiKey = previousKey;
+    config.geminiModel = previousModel;
+  });
+
+  it('ClaudeProvider analyze parses mocked JSON and redacts inline image data', async () => {
+    const previousKey = config.claudeApiKey;
+    const previousModel = config.claudeModel;
+    config.claudeApiKey = 'claude-secret';
+    config.claudeModel = 'claude-3-5-haiku-latest';
+    const fetchImpl = async (_url, options) => {
+      expect(options.headers['x-api-key']).toBe('claude-secret');
+      const body = JSON.parse(options.body);
+      expect(body.messages[0].content[1].source.data).toBeTruthy();
+      return new Response(JSON.stringify({
+        content: [{ type: 'text', text: JSON.stringify({
+          productName: 'Claude Product',
+          title: 'Claude Title',
+          subtitle: 'Claude Subtitle',
+          customPrompt: 'Claude clean ad scene',
+          imageRoles: ['cover'],
+        }) }],
+        usage: { input_tokens: 10, output_tokens: 8 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = new ClaudeProvider({ fetchImpl });
+    const result = await provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png', originalname: 'product.png' }], 'zh-TW');
+    expect(result.productName).toBe('Claude Product');
+    expect(result._meta.provider).toBe('claude');
+    expect(JSON.stringify(result._meta.raw_response_json)).not.toContain(png.toString('base64'));
+    config.claudeApiKey = previousKey;
+    config.claudeModel = previousModel;
+  });
+
+  it('prompt render helper replaces supported variables', async () => {
+    const rendered = renderTemplateString('Product {{product_name}} in {{language}} for {{formats}}', {
+      product_name: 'Coffee',
+      language: 'zh-TW',
+      formats: ['1080x1080', '1200x628'],
+    });
+    expect(rendered).toBe('Product Coffee in zh-TW for 1080x1080, 1200x628');
+  });
+
+  it('uses fallback prompt when active prompt is missing', async () => {
+    run('UPDATE prompt_templates SET is_active = 0 WHERE key = ?', ['banner_generation']);
+    const rendered = renderPromptByKey('banner_generation', { product_name: 'Fallback Product' });
+    expect(rendered.usedFallback).toBe(true);
+    expect(rendered.userPrompt).toContain('Fallback Product');
+  });
+
+  it('local storage adapter stores files and blocks traversal paths', async () => {
+    const adapter = new LocalStorageAdapter();
+    const storagePath = adapter.putUpload({ originalname: 'safe.png', buffer: png }, `test-${Date.now()}.png`);
+    expect(adapter.exists(storagePath)).toBe(true);
+    expect(adapter.getPublicUrl(storagePath)).toContain('/storage/uploads/');
+    expect(() => resolveStoragePath('../secret.txt')).toThrow();
+    adapter.delete(storagePath);
+    expect(adapter.exists(storagePath)).toBe(false);
+  });
+
+  it('storage private paths require owner or admin', async () => {
+    const owner = request.agent(app);
+    const guest = request.agent(app);
+    const { token } = await register(owner, 'storage-owner@example.com');
+    const taskResponse = await createBannerTask(owner, token);
+    expect(taskResponse.status).toBe(201);
+    const image = get('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [taskResponse.body.task_id, 'input']);
+    const ownerRead = await owner.get(`/storage/${image.storage_path}`);
+    expect(ownerRead.status).toBe(200);
+
+    await register(guest, 'storage-guest@example.com');
+    const guestRead = await guest.get(`/storage/${image.storage_path}`);
+    expect(guestRead.status).toBe(403);
+  });
+
+  it('worker can process pending tasks when QUEUE_DRIVER=worker', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'worker-user@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    expect(get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id]).status).toBe('pending');
+
+    const processed = await queueService.processPendingTasks(5);
+    expect(processed).toBeGreaterThanOrEqual(1);
+    expect(get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id]).status).toBe('success');
+    config.queueDriver = previousDriver;
+  });
+
+  it('production missing SESSION_SECRET emits a warning', async () => {
+    const originalEnv = config.nodeEnv;
+    const originalDefault = config.hasDefaultSessionSecret;
+    config.nodeEnv = 'production';
+    config.hasDefaultSessionSecret = true;
+    const messages = [];
+    const warned = warnForProductionConfig({ warn: (message) => messages.push(message) });
+    expect(warned).toBe(true);
+    expect(messages[0]).toContain('SESSION_SECRET');
+    config.nodeEnv = originalEnv;
+    config.hasDefaultSessionSecret = originalDefault;
+  });
+
+  it('OpenAIProvider analyze parses strict JSON responses', async () => {
+    const provider = new OpenAIProvider({
+      client: {
+        responses: {
+          create: async () => ({
+            output_text: JSON.stringify({
+              productName: 'Ceramic Mug',
+              title: 'Morning Starts Here',
+              subtitle: 'Warm, simple, everyday',
+              customPrompt: 'Bright kitchen counter with soft daylight.',
+              imageRoles: ['cover'],
+            }),
+            usage: { input_tokens: 12, output_tokens: 8 },
+          }),
+        },
+      },
+    });
+
+    const result = await provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png' }], 'en');
+
+    expect(result.productName).toBe('Ceramic Mug');
+    expect(result.imageRoles).toEqual(['cover']);
+    expect(result._meta.provider).toBe('openai');
+    expect(result._meta.usage.input_tokens).toBe(12);
+  });
+
+  it('OpenAIProvider analyze extracts JSON from prose', async () => {
+    const provider = new OpenAIProvider({
+      client: {
+        responses: {
+          create: async () => ({
+            output_text:
+              'Sure. {"productName":"Serum","title":"Glow Faster","subtitle":"Lightweight daily care","customPrompt":"clean beauty counter","imageRoles":["cover","detail"]}',
+          }),
+        },
+      },
+    });
+
+    const result = await provider.analyzeProductImages(
+      [
+        { buffer: png, mimetype: 'image/png' },
+        { buffer: png, mimetype: 'image/png' },
+      ],
+      'en',
+    );
+
+    expect(result.productName).toBe('Serum');
+    expect(result.imageRoles).toEqual(['cover', 'detail']);
+  });
+
+  it('OpenAIProvider analyze falls back to fake when non-strict provider fails', async () => {
+    const previousStrict = config.aiStrictProvider;
+    config.aiStrictProvider = false;
+    const provider = new OpenAIProvider({
+      client: {
+        responses: {
+          create: async () => {
+            throw new Error('OpenAI unavailable');
+          },
+        },
+      },
+    });
+
+    const result = await provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png' }], 'en');
+    const metadata = provider.consumeLastRunMetadata();
+
+    expect(result.productName).toBe('Smart Product Name');
+    expect(metadata.provider).toBe('fake');
+    expect(metadata.fallback_from).toBe('openai');
+    config.aiStrictProvider = previousStrict;
+  });
+
+  it('OpenAIProvider analyze throws when strict provider fails', async () => {
+    const previousStrict = config.aiStrictProvider;
+    config.aiStrictProvider = true;
+    const provider = new OpenAIProvider({
+      client: {
+        responses: {
+          create: async () => {
+            throw new Error('OpenAI unavailable');
+          },
+        },
+      },
+    });
+
+    await expect(provider.analyzeProductImages([{ buffer: png, mimetype: 'image/png' }], 'en')).rejects.toThrow(
+      'OpenAI unavailable',
+    );
+    config.aiStrictProvider = previousStrict;
+  });
+
+  it('OpenAIProvider generateBanner uses task formats and quantity for output count', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'openai-count@example.com');
+    run('UPDATE users SET credits_balance = 200 WHERE id = ?', [user.id]);
+    const bootstrap = await agent.get('/api/bootstrap');
+    const format = bootstrap.body.platformFormats.find((item) => item.platform_key === 'facebook');
+    const response = await createBannerTask(agent, token, {
+      platform_format_ids: [format.id],
+      custom_formats: [{ width: 1200, height: 630 }],
+      quantity: 2,
+    });
+    expect(response.status).toBe(201);
+
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          generate: async () => ({ data: [{ b64_json: png.toString('base64') }] }),
+        },
+      },
+    });
+
+    const outputs = await provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+
+    expect(outputs).toHaveLength(4);
+    expect(outputs.every((output) => output.storage_path.startsWith('outputs/'))).toBe(true);
+    config.queueDriver = previousDriver;
+  });
+
+  it('OpenAIProvider generateBanner stores base64 images and omits full base64 from raw metadata', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-base64@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    const hugeBase64 = (await makeImage(1024, 1024, '#22c55e')).toString('base64');
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          generate: async () => ({ data: [{ b64_json: hugeBase64 }] }),
+        },
+      },
+    });
+
+    const outputs = await provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+    const metadata = provider.consumeLastRunMetadata();
+    const rawJson = JSON.stringify(metadata.raw_response_json);
+
+    expect(outputs).toHaveLength(1);
+    expect(fs.existsSync(resolveStoragePath(outputs[0].storage_path))).toBe(true);
+    expect(rawJson).toContain('base64 omitted');
+    expect(rawJson).not.toContain(hugeBase64);
+    config.queueDriver = previousDriver;
+  });
+
+  it('post-processing creates exact target dimensions for common ad formats', async () => {
+    const source = await makeImage(1024, 768);
+    const formats = [
+      { label: 'square', requestedWidth: 1080, requestedHeight: 1080 },
+      { label: 'feed', requestedWidth: 1080, requestedHeight: 1350 },
+      { label: 'story', requestedWidth: 1080, requestedHeight: 1920 },
+      { label: 'wide', requestedWidth: 1920, requestedHeight: 1080 },
+      { label: 'facebook', requestedWidth: 1200, requestedHeight: 628 },
+    ];
+
+    for (let index = 0; index < formats.length; index += 1) {
+      const result = await postProcessImage(source, { taskId: 99, format: formats[index], index });
+      const metadata = await sharp(result.buffer).metadata();
+      expect(metadata.width).toBe(formats[index].requestedWidth);
+      expect(metadata.height).toBe(formats[index].requestedHeight);
+      expect(result.mime_type).toBe('image/png');
+    }
+  });
+
+  it('post-processing output filenames include task, format, and index', () => {
+    const format = { label: 'Instagram Feed', requestedWidth: 1080, requestedHeight: 1350 };
+    const first = buildOutputFilename({ taskId: 7, format, index: 0 });
+    const second = buildOutputFilename({ taskId: 7, format, index: 1 });
+
+    expect(first).toContain('task-7-instagram-feed-1080x1350-0.png');
+    expect(second).toContain('task-7-instagram-feed-1080x1350-1.png');
+    expect(first).not.toBe(second);
+  });
+
+  it('OpenAIProvider generateBanner stores the post-processed target size', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'openai-postprocess@example.com');
+    run('UPDATE users SET credits_balance = 200 WHERE id = ?', [user.id]);
+    const response = await createBannerTask(agent, token, {
+      platform_format_ids: [],
+      custom_formats: [{ width: 1200, height: 628 }],
+    });
+    expect(response.status).toBe(201);
+
+    const sourceImage = await makeImage(1024, 1024);
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          generate: async () => ({ data: [{ b64_json: sourceImage.toString('base64') }] }),
+        },
+      },
+    });
+
+    const outputs = await provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+    const storedMetadata = await sharp(resolveStoragePath(outputs[0].storage_path)).metadata();
+
+    expect(outputs[0].width).toBe(1200);
+    expect(outputs[0].height).toBe(628);
+    expect(storedMetadata.width).toBe(1200);
+    expect(storedMetadata.height).toBe(628);
+    expect(outputs[0].postprocess.target_width).toBe(1200);
+    config.queueDriver = previousDriver;
+  });
+
+  it('banner prompt builder varies by aspect ratio and includes quality safeguards', () => {
+    const task = {
+      product_name: 'Ceramic Mug',
+      main_title: 'Morning Starts Here',
+      subtitle: 'Warm daily coffee',
+      custom_prompt: 'Product analysis: matte white mug with wood handle. data:image/png;base64,AAAAAA',
+      text_mode: 'merged',
+      language: 'en',
+      image_size: '2K',
+      style_key: 'minimal',
+    };
+    const prompts = [
+      buildBannerPrompt({ task, promptText: 'Template', format: { label: 'square', requestedWidth: 1080, requestedHeight: 1080 } }),
+      buildBannerPrompt({ task, promptText: 'Template', format: { label: 'feed', requestedWidth: 1080, requestedHeight: 1350 } }),
+      buildBannerPrompt({ task, promptText: 'Template', format: { label: 'story', requestedWidth: 1080, requestedHeight: 1920 } }),
+    ];
+
+    expect(prompts[0]).toContain('1:1 square composition');
+    expect(prompts[1]).toContain('4:5 vertical');
+    expect(prompts[2]).toContain('9:16 story');
+    expect(prompts[0]).toContain('Product analysis summary');
+    expect(prompts[0]).toContain('Text safe area');
+    expect(prompts[0]).toContain('Preserve the product subject exactly');
+    expect(prompts.join('\n')).not.toContain('data:image/png;base64,AAAAAA');
+    expect(new Set(prompts).size).toBe(3);
+  });
+
+  it('OpenAI fallback fake is recorded with fallback metadata', async () => {
+    const previousProvider = config.aiProvider;
+    const previousStrict = config.aiStrictProvider;
+    const previousKey = config.openaiApiKey;
+    config.aiProvider = 'openai';
+    config.aiStrictProvider = false;
+    config.openaiApiKey = '';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'fallback-log@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    expect(await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'success', 2000)).toBe(true);
+
+    const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ?', [response.body.task_id]);
+    const raw = JSON.parse(log.raw_response_json);
+
+    expect(log.provider).toBe('fake');
+    expect(raw.fallback_used).toBe(true);
+    expect(raw.fallback_reason).toContain('OPENAI_API_KEY');
+    expect(raw.latency_ms).toBeGreaterThanOrEqual(0);
+    config.aiProvider = previousProvider;
+    config.aiStrictProvider = previousStrict;
+    config.openaiApiKey = previousKey;
+  });
+
+  it('strict provider errors are recorded with error code and message', async () => {
+    const previousProvider = config.aiProvider;
+    const previousStrict = config.aiStrictProvider;
+    const previousKey = config.openaiApiKey;
+    config.aiProvider = 'openai';
+    config.aiStrictProvider = true;
+    config.openaiApiKey = '';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'strict-error@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    expect(await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'failed', 2000)).toBe(true);
+
+    const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ?', [response.body.task_id]);
+    const raw = JSON.parse(log.raw_response_json);
+
+    expect(log.provider).toBe('openai');
+    expect(raw.error_code).toBeTruthy();
+    expect(raw.error_message).toContain('OPENAI_API_KEY');
+    expect(raw.latency_ms).toBeGreaterThanOrEqual(0);
+    config.aiProvider = previousProvider;
+    config.aiStrictProvider = previousStrict;
+    config.openaiApiKey = previousKey;
+  });
+
+  it('task meta parser exposes fallback badge and failed error text for the frontend', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'fake',
+      model: 'fake',
+      image_count: 1,
+      cost_usd: 0,
+      raw_response_json: JSON.stringify({
+        fallback_used: true,
+        fallback_reason: 'OpenAI unavailable',
+        latency_ms: 123,
+        error_code: 'provider_error',
+        error_message: 'short failure',
+      }),
+    });
+
+    expect(meta.fallbackUsed).toBe(true);
+    expect(meta.fallbackReason).toBe('OpenAI unavailable');
+    expect(meta.errorMessage).toBe('short failure');
+    expect(meta.latencyMs).toBe(123);
+  });
+
+  it('R2/S3 storage config builder produces expected endpoints', () => {
+    const r2 = buildObjectStorageConfig('r2', {
+      accountId: 'abc123',
+      bucket: 'ad-assets',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+    });
+    const s3 = buildObjectStorageConfig('s3', {
+      endpoint: 'https://s3.example.com',
+      region: 'ap-northeast-1',
+      bucket: 'ad-assets',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+    });
+
+    expect(r2.endpoint).toBe('https://abc123.r2.cloudflarestorage.com');
+    expect(r2.region).toBe('auto');
+    expect(s3.endpoint).toBe('https://s3.example.com');
+    expect(s3.region).toBe('ap-northeast-1');
+  });
+
+  it('ObjectStorageAdapter can write, check, read, and delete through a mocked S3 client', async () => {
+    const calls = [];
+    const stored = new Map();
+    const client = {
+      send: async (command) => {
+        calls.push(command.constructor.name);
+        const input = command.input;
+        if (command.constructor.name === 'PutObjectCommand') {
+          stored.set(input.Key, input.Body);
+          return {};
+        }
+        if (command.constructor.name === 'HeadObjectCommand') {
+          if (!stored.has(input.Key)) {
+            const error = new Error('NotFound');
+            error.name = 'NotFound';
+            throw error;
+          }
+          return {};
+        }
+        if (command.constructor.name === 'GetObjectCommand') {
+          return { Body: stored.get(input.Key) };
+        }
+        if (command.constructor.name === 'DeleteObjectCommand') {
+          stored.delete(input.Key);
+          return {};
+        }
+        return {};
+      },
+    };
+    const adapter = new ObjectStorageAdapter('s3', {
+      endpoint: 'https://s3.example.com',
+      region: 'auto',
+      bucket: 'bucket',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+      client,
+    });
+
+    const storagePath = await adapter.putOutput(Buffer.from('ok'), 'ad.png');
+
+    expect(storagePath).toBe('outputs/ad.png');
+    expect(await adapter.exists(storagePath)).toBe(true);
+    expect(await adapter.read(storagePath)).toEqual(Buffer.from('ok'));
+    await adapter.delete(storagePath);
+    expect(await adapter.exists(storagePath)).toBe(false);
+    expect(calls).toEqual([
+      'PutObjectCommand',
+      'HeadObjectCommand',
+      'GetObjectCommand',
+      'DeleteObjectCommand',
+      'HeadObjectCommand',
+    ]);
+  });
+
+  it('smoke CLI env parser reads staging options', () => {
+    const parsed = parseSmokeEnv({
+      SMOKE_BASE_URL: 'https://staging.example.com/',
+      SMOKE_EMAIL: 'qa@example.com',
+      SMOKE_PASSWORD: 'secret',
+      SMOKE_IMAGE_PATH: 'fixture.png',
+      SMOKE_TIMEOUT_MS: '1234',
+      SMOKE_POLL_INTERVAL_MS: '55',
+      SMOKE_EXPECT_PROVIDER: 'openai',
+      SMOKE_EXPECT_STORAGE_DISK: 'r2',
+    });
+
+    expect(parsed.baseUrl).toBe('https://staging.example.com');
+    expect(parsed.email).toBe('qa@example.com');
+    expect(parsed.imagePath).toBe('fixture.png');
+    expect(parsed.timeoutMs).toBe(1234);
+    expect(parsed.pollIntervalMs).toBe(55);
+    expect(parsed.expectProvider).toBe('openai');
+    expect(parsed.expectStorageDisk).toBe('r2');
+  });
+
+  it('smoke test reports timeout diagnostics', async () => {
+    const fetchImpl = async (url) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === '/api/session') return jsonResponse({ csrfToken: 'csrf' }, 200, { 'set-cookie': 'sid=1' });
+      if (pathName === '/api/auth/register') return jsonResponse({ user: { email: 'smoke@example.com' } });
+      if (pathName === '/api/bootstrap') return jsonResponse({ platformFormats: [{ id: 1, platform_key: 'facebook' }] });
+      if (pathName === '/studio/analyze') return jsonResponse({ productName: 'P', title: 'T', subtitle: 'S', customPrompt: 'C' });
+      if (pathName === '/studio/tasks') return jsonResponse({ task_id: 77 });
+      if (pathName === '/api/tasks/77') return jsonResponse({ task: { id: 77, status: 'pending', ai_cost_logs: [] } });
+      return jsonResponse({}, 404);
+    };
+
+    await expect(
+      runSmokeTest({ baseUrl: 'https://staging.example.com', timeoutMs: 5, pollIntervalMs: 1 }, { fetchImpl }),
+    ).rejects.toMatchObject({ step: 'poll task', taskId: 77 });
+  });
+
+  it('smoke test formats failed task diagnostics', async () => {
+    const fetchImpl = async (url) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === '/api/session') return jsonResponse({ csrfToken: 'csrf' }, 200, { 'set-cookie': 'sid=1' });
+      if (pathName === '/api/auth/register') return jsonResponse({ user: { email: 'smoke@example.com' } });
+      if (pathName === '/api/bootstrap') return jsonResponse({ platformFormats: [{ id: 1, platform_key: 'facebook' }] });
+      if (pathName === '/studio/analyze') return jsonResponse({ productName: 'P', title: 'T', subtitle: 'S', customPrompt: 'C' });
+      if (pathName === '/studio/tasks') return jsonResponse({ task_id: 88 });
+      if (pathName === '/api/tasks/88') {
+        return jsonResponse({
+          task: {
+            id: 88,
+            status: 'failed',
+            error_message: 'provider failed',
+            ai_cost_logs: [
+              {
+                provider: 'openai',
+                model: 'gpt-image-1',
+                image_count: 1,
+                raw_response_json: JSON.stringify({ error_code: 'provider_error', error_message: 'provider failed' }),
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({}, 404);
+    };
+
+    try {
+      await runSmokeTest({ baseUrl: 'https://staging.example.com', timeoutMs: 50, pollIntervalMs: 1 }, { fetchImpl });
+      throw new Error('expected smoke failure');
+    } catch (error) {
+      const formatted = formatSmokeError(error);
+      expect(formatted).toContain('failed step: verify completed/failed');
+      expect(formatted).toContain('task id: 88');
+      expect(formatted).toContain('provider failed');
+    }
+  });
+
+  it('smoke output URL reachable check supports success and diagnostics', async () => {
+    const ok = await verifyOutputUrls(['https://cdn.example.com/a.png'], {
+      fetchImpl: async () => textResponse('ok', 200),
+    });
+    expect(ok[0].ok).toBe(true);
+
+    await expect(
+      verifyOutputUrls(['https://cdn.example.com/missing.png'], {
+        fetchImpl: async () => textResponse('missing', 403),
+      }),
+    ).rejects.toMatchObject({ step: 'verify output urls', status: 403 });
+  });
+
+  it('storage check passes for local storage and cleans up its test file', async () => {
+    const adapter = new LocalStorageAdapter();
+    const result = await runStorageCheck({
+      config: { filesystemDisk: 'local', storagePublicUrl: '', s3: {}, r2: {} },
+      storage: adapter,
+      checkPublicUrl: false,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(adapter.exists(result.storagePath)).toBe(false);
+  });
+
+  it('storage check passes with mocked R2 config and client', async () => {
+    const stored = new Map();
+    const client = {
+      send: async (command) => {
+        const input = command.input;
+        if (command.constructor.name === 'PutObjectCommand') {
+          stored.set(input.Key, input.Body);
+          return {};
+        }
+        if (command.constructor.name === 'HeadObjectCommand') {
+          if (!stored.has(input.Key)) {
+            const error = new Error('NotFound');
+            error.name = 'NotFound';
+            throw error;
+          }
+          return {};
+        }
+        if (command.constructor.name === 'GetObjectCommand') return { Body: stored.get(input.Key) };
+        if (command.constructor.name === 'DeleteObjectCommand') {
+          stored.delete(input.Key);
+          return {};
+        }
+        return {};
+      },
+    };
+    const configForCheck = {
+      filesystemDisk: 'r2',
+      storagePublicUrl: '',
+      s3: {},
+      r2: { accountId: 'abc123', bucket: 'bucket', accessKeyId: 'key', secretAccessKey: 'secret' },
+    };
+    const adapter = new ObjectStorageAdapter('r2', {
+      accountId: 'abc123',
+      bucket: 'bucket',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+      client,
+    });
+
+    const result = await runStorageCheck({ config: configForCheck, storage: adapter, checkPublicUrl: false });
+
+    expect(result.ok).toBe(true);
+    expect(result.objectConfig.endpoint).toBe('https://abc123.r2.cloudflarestorage.com');
+    expect(stored.size).toBe(0);
+  });
+
+  it('storage check returns clear public URL and missing env errors', async () => {
+    const fakeStorage = {
+      async putOutput() {
+        return 'outputs/test.txt';
+      },
+      async exists() {
+        return true;
+      },
+      async read() {
+        return Buffer.from('ad-studio-storage-check');
+      },
+      getPublicUrl() {
+        return 'https://cdn.example.com/outputs/test.txt';
+      },
+      async delete() {},
+    };
+    const publicResult = await runStorageCheck({
+      config: { filesystemDisk: 'local', storagePublicUrl: 'https://cdn.example.com', s3: {}, r2: {} },
+      storage: fakeStorage,
+      fetchImpl: async () => textResponse('forbidden', 403),
+    });
+    const missingResult = await runStorageCheck({
+      config: { filesystemDisk: 'r2', storagePublicUrl: '', s3: {}, r2: {} },
+      storage: fakeStorage,
+      checkPublicUrl: false,
+    });
+
+    expect(publicResult.ok).toBe(false);
+    expect(publicResult.errors[0]).toContain('Public URL GET failed');
+    expect(formatStorageCheck(publicResult)).toContain('STORAGE_PUBLIC_URL');
+    expect(missingResult.ok).toBe(false);
+    expect(missingResult.errors.join(' ')).toContain('R2_ACCOUNT_ID');
+  });
+
+  it('OpenAI auto image mode uses reference edit when input exists', async () => {
+    const previousDriver = config.queueDriver;
+    const previousMode = config.openaiImageMode;
+    config.queueDriver = 'worker';
+    config.openaiImageMode = 'auto';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-edit@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    let editCalled = false;
+    const sourceImage = await makeImage(1024, 1024);
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          edit: async () => {
+            editCalled = true;
+            return { data: [{ b64_json: sourceImage.toString('base64') }] };
+          },
+          generate: async () => {
+            throw new Error('generate should not be called');
+          },
+        },
+      },
+    });
+
+    const outputs = await provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+    const metadata = provider.consumeLastRunMetadata();
+
+    expect(editCalled).toBe(true);
+    expect(outputs[0].width).toBe(1200);
+    expect(metadata.image_mode).toBe('edit');
+    expect(metadata.used_reference_image).toBe(true);
+    config.queueDriver = previousDriver;
+    config.openaiImageMode = previousMode;
+  });
+
+  it('OpenAI edit failure falls back to prompt generation when non-strict', async () => {
+    const previousDriver = config.queueDriver;
+    const previousMode = config.openaiImageMode;
+    const previousStrict = config.aiStrictProvider;
+    config.queueDriver = 'worker';
+    config.openaiImageMode = 'auto';
+    config.aiStrictProvider = false;
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-edit-fallback@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    const sourceImage = await makeImage(1024, 1024);
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          edit: async () => {
+            throw new Error('edit unsupported');
+          },
+          generate: async () => ({ data: [{ b64_json: sourceImage.toString('base64') }] }),
+        },
+      },
+    });
+
+    const outputs = await provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+    const metadata = provider.consumeLastRunMetadata();
+
+    expect(outputs[0].postprocess.target_width).toBe(1200);
+    expect(metadata.image_mode).toBe('generate');
+    expect(metadata.used_reference_image).toBe(false);
+    expect(metadata.fallback_reason).toContain('reference edit failed');
+    config.queueDriver = previousDriver;
+    config.openaiImageMode = previousMode;
+    config.aiStrictProvider = previousStrict;
+  });
+
+  it('OpenAI edit failure throws when strict provider is enabled', async () => {
+    const previousDriver = config.queueDriver;
+    const previousMode = config.openaiImageMode;
+    const previousStrict = config.aiStrictProvider;
+    config.queueDriver = 'worker';
+    config.openaiImageMode = 'auto';
+    config.aiStrictProvider = true;
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-edit-strict@example.com');
+    const response = await createBannerTask(agent, token);
+    expect(response.status).toBe(201);
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          edit: async () => {
+            throw new Error('edit unsupported');
+          },
+          generate: async () => ({ data: [{ b64_json: png.toString('base64') }] }),
+        },
+      },
+    });
+
+    await expect(provider.generateBanner(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]))).rejects.toThrow(
+      'edit unsupported',
+    );
+    config.queueDriver = previousDriver;
+    config.openaiImageMode = previousMode;
+    config.aiStrictProvider = previousStrict;
+  });
+
+  it('task metadata parser handles missing fields and exposes debug fields', () => {
+    const empty = parseTaskCostMeta();
+    const meta = parseTaskCostMeta({
+      provider: 'openai',
+      model: 'gpt-image-1',
+      image_count: 2,
+      raw_response_json: JSON.stringify({
+        fallback_reason: 'reference edit failed',
+        image_mode: 'generate',
+        used_reference_image: true,
+        storage_disk: 'r2',
+        error_code: 'provider_error',
+        error_message: 'short error',
+      }),
+    });
+
+    expect(empty.fallbackUsed).toBe(false);
+    expect(meta.fallbackReason).toBe('reference edit failed');
+    expect(meta.imageMode).toBe('generate');
+    expect(meta.usedReferenceImage).toBe(true);
+    expect(meta.storageDisk).toBe('r2');
+    expect(meta.errorCode).toBe('provider_error');
+    expect(imageLoadErrorMessage()).toContain('storage public URL');
+  });
+
+  it('admin routes require admin and task list tolerates missing metadata', async () => {
+    const userAgent = request.agent(app);
+    await register(userAgent, 'plain-admin-denied@example.com');
+    expect((await userAgent.get('/api/admin/summary')).status).toBe(403);
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'phase6-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [adminSession.user.id, 'banner', 'pending', 'zh-TW', '2K', 'keep', 1, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+
+    const response = await adminAgent.get('/api/admin/tasks?q=phase6-admin');
+    expect(response.status).toBe(200);
+    expect(response.body.tasks.some((task) => task.id === taskId)).toBe(true);
+    expect(response.body.tasks.find((task) => task.id === taskId).provider).toBeNull();
+  });
+
+  it('admin summary counts fallback tasks and redacts raw base64', async () => {
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'phase6-redact@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const nowIso = new Date().toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [adminSession.user.id, 'banner', 'success', 'zh-TW', '2K', 'keep', 1, 0, 0, nowIso, nowIso],
+    );
+    insert(
+      `INSERT INTO ai_cost_logs (task_id, provider, model, image_count, cost_usd, raw_response_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        taskId,
+        'fake',
+        'fake',
+        1,
+        0,
+        JSON.stringify({ fallback_used: true, b64_json: 'a'.repeat(400), latency_ms: 12 }),
+        nowIso,
+        nowIso,
+      ],
+    );
+
+    const summary = await adminAgent.get('/api/admin/summary');
+    expect(summary.status).toBe(200);
+    expect(summary.body.stats.todayFallbacks).toBeGreaterThanOrEqual(1);
+    const detail = getAdminTaskDetail(taskId);
+    expect(JSON.stringify(detail.ai_cost_logs[0].raw_response_json_safe)).toContain('[redacted_base64]');
+    expect(JSON.stringify(safeRawResponse(JSON.stringify({ image: 'a'.repeat(400) })))).toContain('[redacted_base64]');
+  });
+
+  it('admin failed task view exposes concise error fields and user search paginates', async () => {
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'phase6-failed@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    await register(request.agent(app), 'phase6-search-one@example.com');
+    await register(request.agent(app), 'phase6-search-two@example.com');
+    const nowIso = new Date().toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, error_message, last_error_code, last_error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [adminSession.user.id, 'banner', 'failed', 'zh-TW', '2K', 'keep', 1, 0, 0, 'provider down', 'provider_error', 'provider down', nowIso, nowIso],
+    );
+
+    const failed = await adminAgent.get('/api/admin/tasks/failed');
+    expect(failed.status).toBe(200);
+    expect(failed.body.tasks.find((task) => task.id === taskId).error_code).toBe('provider_error');
+    const users = await adminAgent.get('/api/admin/users?q=phase6-search&limit=1');
+    expect(users.status).toBe(200);
+    expect(users.body.users.length).toBe(1);
+    expect(users.body.total).toBeGreaterThanOrEqual(2);
+  });
+
+  it('env diagnostics cover local pass and production blockers', () => {
+    expect(runEnvDiagnostics({ NODE_ENV: 'development', AI_PROVIDER: 'fake', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', SESSION_SECRET: 'dev-secret', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).ok).toBe(true);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', AUTH_BYPASS: 'true', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'openai', OPENAI_API_KEY: 'sk-test', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(false);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'fake', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(false);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'fake', ALLOW_FAKE_PROVIDER: 'true', ALLOW_SQLITE_IN_PRODUCTION: 'true', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(true);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'openai', OPENAI_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).checks.some((check) => check.key === 'OPENAI_API_KEY' && check.level === 'FAIL')).toBe(true);
+    expect(runEnvDiagnostics({ AI_PROVIDER: 'gemini', GEMINI_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).checks.some((check) => check.key === 'GEMINI_API_KEY' && check.level === 'FAIL')).toBe(true);
+    expect(runEnvDiagnostics({ AI_PROVIDER: 'claude', ANTHROPIC_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).checks.some((check) => check.key === 'ANTHROPIC_API_KEY' && check.level === 'FAIL')).toBe(true);
+    expect(runEnvDiagnostics({ AI_PROVIDER: 'devpilot-gateway', DEVPILOT_GATEWAY_BASE_URL: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).checks.some((check) => check.key === 'DEVPILOT_GATEWAY_BASE_URL' && check.level === 'FAIL')).toBe(true);
+    expect(runEnvDiagnostics({ FILESYSTEM_DISK: 'r2', R2_ACCOUNT_ID: 'acct', R2_ACCESS_KEY_ID: 'key', R2_SECRET_ACCESS_KEY: 'secret' }).ok).toBe(false);
+    expect(runEnvDiagnostics({ FILESYSTEM_DISK: 's3', S3_REGION: 'auto', S3_BUCKET: 'bucket', S3_ACCESS_KEY_ID: 'key', S3_SECRET_ACCESS_KEY: 'secret' }).ok).toBe(false);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'openai', OPENAI_API_KEY: 'sk-test', AI_STRICT_PROVIDER: 'false', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).checks.some((check) => check.key === 'AI_STRICT_PROVIDER' && check.level === 'WARN')).toBe(true);
+  });
+
+  it('env check CLI exits non-zero on failures', () => {
+    const result = spawnSync(process.execPath, ['server/cli/env-check.js'], {
+      cwd: process.cwd(),
+      env: { ...process.env, NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: '', AI_PROVIDER: 'openai', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker' },
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('FAIL');
+  });
+
+  it('smoke and storage diagnostics can write JSON reports', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-report-'));
+    const smokeReport = path.join(dir, 'nested', 'smoke.json');
+    const fetchImpl = async (url) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === '/api/session') return jsonResponse({ csrfToken: 'csrf' }, 200, { 'set-cookie': 'sid=1' });
+      if (pathName === '/api/auth/register') return jsonResponse({ user: { email: 'smoke@example.com' } });
+      if (pathName === '/api/bootstrap') return jsonResponse({ platformFormats: [{ id: 1, platform_key: 'facebook' }] });
+      if (pathName === '/studio/analyze') return jsonResponse({ productName: 'P', title: 'T', subtitle: 'S', customPrompt: 'C' });
+      if (pathName === '/studio/tasks') return jsonResponse({ task_id: 99 });
+      if (pathName === '/api/tasks/99') {
+        return jsonResponse({ task: { id: 99, status: 'success', ai_cost_logs: [{ provider: 'fake', model: 'fake', image_count: 1, cost_usd: 0, raw_response_json: JSON.stringify({ storage_disk: 'local', latency_ms: 10, fallback_used: true, fallback_reason: 'OpenAI failed with sk-testsecret123 and ' + 'a'.repeat(300) }) }], output_images: [{ url: '/storage/out.png' }] } });
+      }
+      if (pathName === '/storage/out.png') return textResponse('png');
+      return jsonResponse({}, 404);
+    };
+    await runSmokeTest({ baseUrl: 'https://staging.example.com', timeoutMs: 50, pollIntervalMs: 1, reportPath: smokeReport }, { fetchImpl });
+    const smokeJson = JSON.parse(fs.readFileSync(smokeReport, 'utf8'));
+    expect(smokeJson.task_id).toBe(99);
+    expect(smokeJson.status).toBe('success');
+    expect(smokeJson.fallback_used).toBe(true);
+    expect(smokeJson.fallback_reason).toContain('[redacted_api_key]');
+    expect(smokeJson.fallback_reason).toContain('[redacted_base64]');
+    expect(JSON.stringify(smokeJson)).not.toContain('sk-testsecret123');
+
+    const storageReport = path.join(dir, 'storage', 'report.json');
+    const fakeStorage = {
+      putOutput: async () => 'outputs/check.txt',
+      exists: async () => true,
+      read: async () => Buffer.from('ad-studio-storage-check'),
+      delete: async () => {},
+      getPublicUrl: () => 'https://cdn.example.com/outputs/check.txt',
+    };
+    const storage = await runStorageCheck({
+      config: { filesystemDisk: 'local', storagePublicUrl: '', r2: {}, s3: {} },
+      storage: fakeStorage,
+      checkPublicUrl: false,
+      reportPath: storageReport,
+    });
+    expect(storage.ok).toBe(true);
+    const storageJson = JSON.parse(fs.readFileSync(storageReport, 'utf8'));
+    expect(JSON.stringify(storageJson)).not.toContain('secret');
+    expect(storageJson.write_ok).toBe(true);
+    expect(storageJson).toHaveProperty('delete_ok');
+  });
+
+  it('storage public URL failure report includes actionable suggestions and redacts secrets', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-storage-public-'));
+    const reportPath = path.join(dir, 'storage-public.json');
+    const fakeStorage = {
+      putOutput: async () => 'outputs/check.txt',
+      exists: async () => true,
+      read: async () => Buffer.from('ad-studio-storage-check'),
+      delete: async () => {},
+      getPublicUrl: () => 'https://assets.example.com/outputs/check.txt?token=sk-secretvalue1234567890',
+    };
+    const result = await runStorageCheck({
+      config: { filesystemDisk: 'r2', storagePublicUrl: 'https://assets.example.com', r2: { accountId: 'abc', bucket: 'bucket', accessKeyId: 'key', secretAccessKey: 'secret' }, s3: {} },
+      storage: fakeStorage,
+      fetchImpl: async () => textResponse('forbidden', 403),
+      reportPath,
+    });
+    expect(result.ok).toBe(false);
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    expect(report.public_url_ok).toBe(false);
+    expect(report.suggestions.join(' ')).toContain('bucket permission');
+    expect(report.suggestions.join(' ')).toContain('STORAGE_PUBLIC_URL');
+    expect(report.suggestions.join(' ')).toContain('CORS');
+    expect(JSON.stringify(report)).not.toContain('sk-secretvalue1234567890');
+    expect(JSON.stringify(report)).not.toContain('secret');
+  });
+
+  it('storage check CLI handles missing R2 env without stack trace', () => {
+    const result = spawnSync(process.execPath, ['server/cli/storage-check.js'], {
+      cwd: process.cwd(),
+      env: { ...process.env, FILESYSTEM_DISK: 'r2', R2_ACCOUNT_ID: '', R2_BUCKET: '', R2_ACCESS_KEY_ID: '', R2_SECRET_ACCESS_KEY: '' },
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('R2_ACCOUNT_ID is required');
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain('at ObjectStorageAdapter');
+  });
+
+  it('smoke health check failure writes failed step and suggestions', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-smoke-health-'));
+    const reportPath = path.join(dir, 'smoke-health.json');
+    await expect(
+      runSmokeTest(
+        { baseUrl: 'https://staging.example.com', reportPath, timeoutMs: 5, pollIntervalMs: 1 },
+        { fetchImpl: async () => { throw new Error('connect refused'); } },
+      ),
+    ).rejects.toMatchObject({ step: 'health check' });
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    expect(report.failed_step).toBe('health check');
+    expect(report.suggestions.join(' ')).toContain('SMOKE_BASE_URL');
+  });
+
+  it('smoke failed reports still include failed_step', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-smoke-fail-'));
+    const reportPath = path.join(dir, 'smoke-failed.json');
+    const fetchImpl = async (url) => {
+      const pathName = new URL(url).pathname;
+      if (pathName === '/api/session') return jsonResponse({ csrfToken: 'csrf' }, 200, { 'set-cookie': 'sid=1' });
+      return jsonResponse({ message: 'boom' }, 500);
+    };
+    await expect(runSmokeTest({ baseUrl: 'https://staging.example.com', reportPath, timeoutMs: 5, pollIntervalMs: 1 }, { fetchImpl })).rejects.toMatchObject({ step: 'login' });
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    expect(report.failed_step).toBe('login');
+  });
+
+  it('quality review creates markdown and handles missing outputs', async () => {
+    const agent = request.agent(app);
+    const session = await register(agent, 'quality@example.com');
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, main_title, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'success', 'Quality Product', 'Quality Title', 'zh-TW', '2K', 'keep', 1, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    const outputPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'quality-review-')), 'review.md');
+    const result = await runQualityReview({ QUALITY_TASK_IDS: String(taskId), QUALITY_REVIEW_PATH: outputPath });
+    expect(result.markdown).toContain(`Task #${taskId}`);
+    expect(result.markdown).toContain('_No output images_');
+    expect(fs.existsSync(outputPath)).toBe(true);
+  });
+
+  it('task failure policy increments retry count and stops retrying validation errors', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'retry-policy@example.com');
+    const retryable = await createBannerTask(agent, token, { custom_prompt: '__RETRYABLE_FAIL__' });
+    await GenerateTaskJob.handle(retryable.body.task_id);
+    let task = get('SELECT * FROM generation_tasks WHERE id = ?', [retryable.body.task_id]);
+    expect(task.status).toBe('pending');
+    expect(task.retry_count).toBe(1);
+    run('UPDATE generation_tasks SET retry_count = max_retries WHERE id = ?', [retryable.body.task_id]);
+    await GenerateTaskJob.handle(retryable.body.task_id);
+    task = get('SELECT * FROM generation_tasks WHERE id = ?', [retryable.body.task_id]);
+    expect(task.status).toBe('failed');
+    expect(task.last_error_code).toBe('storage_error');
+
+    const validation = await createBannerTask(agent, token, { custom_prompt: '__FAKE_FAIL__' });
+    await GenerateTaskJob.handle(validation.body.task_id);
+    const validationTask = get('SELECT * FROM generation_tasks WHERE id = ?', [validation.body.task_id]);
+    expect(validationTask.status).toBe('failed');
+    expect(validationTask.retry_count).toBe(0);
+    expect(classifyTaskError({ code: 'storage_error', message: 'R2 timeout' }).retryable).toBe(true);
+    config.queueDriver = previousDriver;
+  });
+
+  it('tasks:recover dry run and requeue mutate only when requested', async () => {
+    const agent = request.agent(app);
+    const session = await register(agent, 'recover@example.com');
+    const oldIso = new Date(Date.now() - 60 * 60_000).toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, processing_started_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'processing', 'zh-TW', '2K', 'keep', 1, 0, 0, oldIso, oldIso, oldIso],
+    );
+    const dry = recoverStuckTasks({ afterMinutes: 15, dryRun: true, action: 'requeue' });
+    expect(dry.tasks.some((task) => task.id === taskId)).toBe(true);
+    expect(get('SELECT status FROM generation_tasks WHERE id = ?', [taskId]).status).toBe('processing');
+    recoverStuckTasks({ afterMinutes: 15, dryRun: false, action: 'requeue' });
+    expect(get('SELECT status FROM generation_tasks WHERE id = ?', [taskId]).status).toBe('pending');
+  });
+
+  it('admin retry requires admin privileges', async () => {
+    const userAgent = request.agent(app);
+    const userSession = await register(userAgent, 'retry-denied@example.com');
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [userSession.user.id, 'banner', 'failed', 'zh-TW', '2K', 'keep', 1, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    const userCsrf = await csrf(userAgent);
+    expect((await userAgent.post(`/api/admin/tasks/${taskId}/retry`).set('x-csrf-token', userCsrf).send({})).status).toBe(403);
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'retry-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const adminCsrf = await csrf(adminAgent);
+    const response = await adminAgent.post(`/api/admin/tasks/${taskId}/retry`).set('x-csrf-token', adminCsrf).send({});
+    expect(response.status).toBe(200);
+    expect(response.body.task.status).toBe('pending');
+  });
+
+  it('security and empty state APIs stay safe for production UX', async () => {
+    const agent = request.agent(app);
+    await register(agent, 'empty-state@example.com');
+    expect((await agent.get('/api/assets')).status).toBe(200);
+    expect((await agent.get('/api/credits')).status).toBe(200);
+    config.openaiApiKey = 'sk-never-render-this';
+    const bootstrap = await agent.get('/api/bootstrap');
+    expect(JSON.stringify(bootstrap.body)).not.toContain('sk-never-render-this');
+
+    const token = await csrf(agent);
+    const invalid = await agent
+      .post('/studio/analyze')
+      .set('x-csrf-token', token)
+      .attach('images', Buffer.from('bad'), { filename: 'bad.txt', contentType: 'text/plain' });
+    expect(invalid.status).toBe(422);
+    const tooLarge = await agent
+      .post('/studio/analyze')
+      .set('x-csrf-token', token)
+      .attach('images', Buffer.alloc(10 * 1024 * 1024 + 1), { filename: 'huge.png', contentType: 'image/png' });
+    expect(tooLarge.status).toBe(422);
+  });
+
+  it('registration can be disabled without blocking existing admin tools', async () => {
+    const previous = config.registrationEnabled;
+    config.registrationEnabled = false;
+    const agent = request.agent(app);
+    const token = await csrf(agent);
+    const response = await agent
+      .post('/api/auth/register')
+      .set('x-csrf-token', token)
+      .send({ name: 'Closed', email: 'closed@example.com', password: 'password123', terms: true });
+    expect(response.status).toBe(403);
+    config.registrationEnabled = previous;
+  });
+
+  it('health endpoints expose version and redact config details', async () => {
+    const health = await request(app).get('/health');
+    expect(health.status).toBe(200);
+    expect(health.body.version).toBe(config.appVersion);
+    const deep = await request(app).get('/health/deep');
+    expect(deep.status).toBe(200);
+    expect(JSON.stringify(deep.body)).not.toContain(config.openaiApiKey || 'sk-');
+    expect(deep.body.checks.provider.name).toBeDefined();
+  });
+
+  it('admin storage, system, provider, and quality endpoints require admin and stay redacted', async () => {
+    const userAgent = request.agent(app);
+    await register(userAgent, 'storage-user@example.com');
+    expect((await userAgent.get('/api/admin/storage')).status).toBe(403);
+    expect((await userAgent.get('/api/admin/providers')).status).toBe(403);
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'storage-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const previousR2Secret = config.r2.secretAccessKey;
+    config.r2.secretAccessKey = 'super-secret-token';
+    const storage = await adminAgent.get('/api/admin/storage');
+    expect(storage.status).toBe(200);
+    expect(adminStorageSummary().disk).toBe(config.filesystemDisk);
+    expect(JSON.stringify(storage.body)).not.toContain('super-secret-token');
+    config.r2.secretAccessKey = previousR2Secret;
+
+    const system = await adminAgent.get('/api/admin/system');
+    expect(system.status).toBe(200);
+    expect(system.body.version).toBe(config.appVersion);
+    expect(system.body.providers.map((provider) => provider.name)).toContain('gemini');
+
+    const providers = await adminAgent.get('/api/admin/providers');
+    expect(providers.status).toBe(200);
+    expect(providers.body.providers.map((provider) => provider.name)).toEqual(expect.arrayContaining(['fake', 'openai', 'gemini', 'claude', 'devpilot-gateway']));
+    expect(JSON.stringify(providers.body)).not.toContain(config.openaiApiKey || 'sk-');
+
+    const ping = await adminAgent.post('/api/admin/providers/fake/ping').set('x-csrf-token', adminSession.token).send({});
+    expect(ping.status).toBe(200);
+    expect(ping.body.ok).toBe(true);
+
+    const quality = await adminAgent.get('/api/admin/quality');
+    expect(quality.status).toBe(200);
+    expect(Array.isArray(quality.body.recentTasks)).toBe(true);
+  });
+
+  it('quality review saves admin notes and markdown includes saved review', async () => {
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'quality-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const token = await csrf(adminAgent);
+    const task = await createBannerTask(adminAgent, token);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [task.body.task_id])?.status === 'success');
+    const review = await adminAgent
+      .post('/api/admin/quality')
+      .set('x-csrf-token', token)
+      .send({ task_id: task.body.task_id, product_preserved: 'pass', no_garbled_text: 'pass', commercial_quality: 5, notes: 'looks good' });
+    expect(review.status).toBe(200);
+    const result = await runQualityReview({ QUALITY_TASK_IDS: String(task.body.task_id) });
+    expect(result.markdown).toContain('looks good');
+  });
+
+  it('Gemini and Claude text providers normalize mocked execution safely', async () => {
+    const previousGeminiKey = config.geminiApiKey;
+    const previousGeminiModel = config.geminiModel;
+    const previousClaudeKey = config.claudeApiKey;
+    const previousClaudeModel = config.claudeModel;
+    config.geminiApiKey = '';
+    const missingGemini = await new GeminiProvider().generateText({ prompt: 'hello' });
+    expect(missingGemini.ok).toBe(false);
+    expect(missingGemini.retryable).toBe(false);
+
+    let geminiRequest;
+    config.geminiApiKey = 'gemini-secret-never-leak';
+    config.geminiModel = 'gemini-1.5-flash';
+    const gemini = new GeminiProvider({
+      fetchImpl: async (_url, options) => {
+        geminiRequest = JSON.parse(options.body);
+        return jsonResponse({
+          candidates: [{ content: { parts: [{ text: 'GEMINI_OK' }] } }],
+          usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2, totalTokenCount: 5 },
+        });
+      },
+    });
+    const geminiOk = await gemini.generateText({ prompt: 'ping gemini', model: 'gemini-1.5-flash' });
+    expect(geminiOk).toMatchObject({ ok: true, provider: 'gemini', output: 'GEMINI_OK' });
+    expect(geminiRequest.contents[0].parts[0].text).toBe('ping gemini');
+    expect(geminiOk.usage.total_tokens).toBe(5);
+
+    const gemini403 = await new GeminiProvider({
+      fetchImpl: async () => jsonResponse({ error: { message: 'bad gemini-secret-never-leak', status: 'PERMISSION_DENIED' } }, 403),
+    }).generateText({ prompt: 'deny' });
+    expect(gemini403.retryable).toBe(false);
+    expect(JSON.stringify(gemini403)).not.toContain('gemini-secret-never-leak');
+    const gemini429 = await new GeminiProvider({ fetchImpl: async () => jsonResponse({ error: { message: 'slow down' } }, 429) }).generateText({ prompt: 'rate' });
+    expect(gemini429.retryable).toBe(true);
+    const gemini500 = await new GeminiProvider({ fetchImpl: async () => jsonResponse({ error: { message: 'server' } }, 500) }).generateText({ prompt: 'server' });
+    expect(gemini500.retryable).toBe(true);
+    const geminiTimeout = await new GeminiProvider({ fetchImpl: async () => { const error = new Error('timeout'); error.name = 'AbortError'; throw error; } }).generateText({ prompt: 'timeout' });
+    expect(geminiTimeout.retryable).toBe(true);
+
+    config.claudeApiKey = '';
+    const missingClaude = await new ClaudeProvider().generateText({ prompt: 'hello' });
+    expect(missingClaude.ok).toBe(false);
+    expect(missingClaude.retryable).toBe(false);
+
+    let claudeRequest;
+    config.claudeApiKey = 'claude-secret-never-leak';
+    config.claudeModel = 'claude-3-5-haiku-latest';
+    const claudeOk = await new ClaudeProvider({
+      fetchImpl: async (_url, options) => {
+        claudeRequest = JSON.parse(options.body);
+        return jsonResponse({
+          content: [{ text: 'CLAUDE_OK' }],
+          usage: { input_tokens: 4, output_tokens: 2 },
+        });
+      },
+    }).generateText({ prompt: 'ping claude', model: 'claude-3-5-haiku-latest' });
+    expect(claudeOk).toMatchObject({ ok: true, provider: 'claude', output: 'CLAUDE_OK' });
+    expect(claudeRequest.messages[0].content[0].text).toBe('ping claude');
+    expect(claudeOk.usage.total_tokens).toBe(6);
+
+    const claude403 = await new ClaudeProvider({
+      fetchImpl: async () => jsonResponse({ error: { message: 'bad claude-secret-never-leak', type: 'permission_error' } }, 403),
+    }).generateText({ prompt: 'deny' });
+    expect(claude403.retryable).toBe(false);
+    expect(JSON.stringify(claude403)).not.toContain('claude-secret-never-leak');
+    const claude429 = await new ClaudeProvider({ fetchImpl: async () => jsonResponse({ error: { message: 'rate' } }, 429) }).generateText({ prompt: 'rate' });
+    expect(claude429.retryable).toBe(true);
+    const claude500 = await new ClaudeProvider({ fetchImpl: async () => jsonResponse({ error: { message: 'server' } }, 500) }).generateText({ prompt: 'server' });
+    expect(claude500.retryable).toBe(true);
+    const claudeTimeout = await new ClaudeProvider({ fetchImpl: async () => { const error = new Error('timeout'); error.name = 'AbortError'; throw error; } }).generateText({ prompt: 'timeout' });
+    expect(claudeTimeout.retryable).toBe(true);
+
+    const livePing = await pingProvider('gemini', { live: true, fetchImpl: async () => jsonResponse({ candidates: [{ content: { parts: [{ text: 'GEMINI_OK' }] } }] }) });
+    expect(livePing.ok).toBe(true);
+
+    config.geminiApiKey = previousGeminiKey;
+    config.geminiModel = previousGeminiModel;
+    config.claudeApiKey = previousClaudeKey;
+    config.claudeModel = previousClaudeModel;
+  });
+
+  it('provider selection, asset metadata, quality flags, and audit APIs stay safe', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'provider-selection@example.com');
+    const fallback = await createBannerTask(agent, token, {
+      provider: 'gemini',
+      model: 'gemini-1.5-flash',
+      capability: 'image_generation',
+      quality_review_required: true,
+    });
+    expect(fallback.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [fallback.body.task_id])?.status === 'success');
+    const task = get('SELECT * FROM generation_tasks WHERE id = ?', [fallback.body.task_id]);
+    expect(task.requested_provider).toBe('gemini');
+    expect(task.resolved_provider).toBe('fake');
+    expect(task.provider_selection_reason).toContain('fallback');
+    expect(task.quality_review_required).toBe(1);
+
+    const strict = await createBannerTask(agent, token, { provider: 'gemini', strict_provider: true });
+    expect(strict.status).toBe(422);
+
+    const assets = await agent.get('/api/assets?type=output');
+    const asset = assets.body.assets.find((item) => item.task_id === fallback.body.task_id);
+    expect(asset).toBeTruthy();
+    const metadata = await agent
+      .post(`/api/assets/${asset.id}/metadata`)
+      .set('x-csrf-token', token)
+      .send({ favorite: true, tags: 'hero,approved', notes: 'demo note' });
+    expect(metadata.status).toBe(200);
+    expect(listAssets({ user: { id: task.user_id }, query: { type: 'output', q: String(task.id) } }).assets[0].favorite).toBe(true);
+    const manifest = await agent.get(`/api/assets/export-manifest?ids=${asset.id}`);
+    expect(manifest.status).toBe(200);
+    expect(JSON.stringify(manifest.body)).not.toContain('secret');
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'provider-selection-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const review = await adminAgent
+      .post('/api/admin/quality')
+      .set('x-csrf-token', adminSession.token)
+      .send({ task_id: fallback.body.task_id, approved: false, needs_regeneration: true, regeneration_reason: 'needs sharper logo', notes: 'reviewed' });
+    expect(review.status).toBe(200);
+    const detail = await agent.get(`/api/tasks/${fallback.body.task_id}`);
+    expect(detail.body.task.quality_reviews[0].needs_regeneration).toBe(1);
+    const quality = await runQualityReview({ QUALITY_TASK_IDS: String(fallback.body.task_id) });
+    expect(quality.markdown).toContain('needs_regeneration');
+
+    const audit = await adminAgent.get('/api/admin/audit');
+    expect(audit.status).toBe(200);
+    expect(audit.body.logs.some((log) => log.action === 'asset_metadata_update')).toBe(true);
+    expect(JSON.stringify(audit.body)).not.toContain('secret');
+    const usage = await adminAgent.get('/api/admin/usage');
+    expect(usage.status).toBe(200);
+    expect(usage.body.tasksByProvider.fake).toBeGreaterThanOrEqual(1);
+  });
+
+  it('external API rate limit is per source and rc:local report is redacted', async () => {
+    resetExternalApiRateLimits();
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    const previousEnabled = config.externalApiRateLimitEnabled;
+    const previousMax = config.externalApiRateLimitMax;
+    const previousWindow = config.externalApiRateLimitWindowMs;
+    config.devpilotExternalApiKeysRaw = 'source-a:key-a';
+    config.externalApiRateLimitEnabled = true;
+    config.externalApiRateLimitMax = 1;
+    config.externalApiRateLimitWindowMs = 60_000;
+
+    const first = await request(app).get('/api/external/ai-handoffs').set('X-DevPilot-Source-System', 'source-a').set('X-DevPilot-Api-Key', 'key-a');
+    expect(first.status).toBe(200);
+    const second = await request(app).get('/api/external/ai-handoffs').set('X-DevPilot-Source-System', 'source-a').set('X-DevPilot-Api-Key', 'key-a');
+    expect(second.status).toBe(429);
+    expect(JSON.stringify(second.body)).not.toContain('key-a');
+    const logs = listAuditLogs({ action: 'external_api_rate_limited' }).logs;
+    expect(logs.length).toBeGreaterThan(0);
+    expect(JSON.stringify(logs)).not.toContain('key-a');
+
+    const report = await runRcLocalDiagnostics({
+      reportPath: path.join(os.tmpdir(), `rc-local-${Date.now()}.json`),
+      storageCheck: async () => ({ ok: true, disk: 'local', checks: {}, errors: [] }),
+      fetchImpl: async () => jsonResponse({ ok: true, secret: 'should-be-redacted', openaiApiKey: 'sk-report-secret' }),
+    });
+    expect(report.ok).toBe(true);
+    expect(JSON.stringify(report)).not.toContain('sk-report-secret');
+    expect(JSON.stringify(report)).toContain('[redacted]');
+
+    config.devpilotExternalApiKeysRaw = previousKeys;
+    config.externalApiRateLimitEnabled = previousEnabled;
+    config.externalApiRateLimitMax = previousMax;
+    config.externalApiRateLimitWindowMs = previousWindow;
+    resetExternalApiRateLimits();
+  });
+
+  it('ai:ping normalizes live provider diagnostics and writes redacted reports', async () => {
+    const reportPath = path.join(os.tmpdir(), `ai-ping-${Date.now()}.json`);
+    const geminiOk = await runAiPing({
+      env: {
+        AI_PING_PROVIDER: 'gemini',
+        GEMINI_API_KEY: 'gemini-live-secret',
+        AI_PING_MODEL: 'gemini-1.5-flash',
+        AI_PING_PROMPT: 'ping',
+        AI_PING_REPORT_PATH: reportPath,
+      },
+      fetchImpl: async () => jsonResponse({
+        candidates: [{ content: { parts: [{ text: 'GEMINI_OK' }] } }],
+        usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
+      }),
+    });
+    expect(geminiOk).toMatchObject({ ok: true, provider: 'gemini', output: 'GEMINI_OK' });
+    expect(geminiOk.usage.total_tokens).toBe(3);
+    const written = fs.readFileSync(reportPath, 'utf8');
+    expect(written).not.toContain('gemini-live-secret');
+
+    const gemini403 = await runAiPing({
+      env: { AI_PING_PROVIDER: 'gemini', GEMINI_API_KEY: 'gemini-live-secret', AI_PING_REPORT_PATH: path.join(os.tmpdir(), `ai-ping-403-${Date.now()}.json`) },
+      fetchImpl: async () => jsonResponse({ error: { message: 'bad gemini-live-secret', status: 'PERMISSION_DENIED' } }, 403),
+    });
+    expect(gemini403.ok).toBe(false);
+    expect(gemini403.diagnosis.code).toBe('credential_rejected');
+    expect(JSON.stringify(gemini403)).not.toContain('gemini-live-secret');
+
+    const gemini429 = await runAiPing({
+      env: { AI_PING_PROVIDER: 'gemini', GEMINI_API_KEY: 'gemini-live-secret' },
+      fetchImpl: async () => jsonResponse({ error: { message: 'quota exceeded' } }, 429),
+    });
+    expect(gemini429.diagnosis.code).toBe('quota_or_rate_limit');
+    expect(gemini429.retryable).toBe(true);
+
+    const claude500 = await runAiPing({
+      env: { AI_PING_PROVIDER: 'claude', ANTHROPIC_API_KEY: 'claude-live-secret' },
+      fetchImpl: async () => jsonResponse({ error: { message: 'upstream down' } }, 500),
+    });
+    expect(claude500.diagnosis.code).toBe('provider_server_error');
+    expect(claude500.retryable).toBe(true);
+    expect(JSON.stringify(claude500)).not.toContain('claude-live-secret');
+
+    const timeout = await runAiPing({
+      env: { AI_PING_PROVIDER: 'gemini', GEMINI_API_KEY: 'gemini-live-secret' },
+      fetchImpl: async () => { const error = new Error('timeout'); error.name = 'AbortError'; throw error; },
+    });
+    expect(timeout.diagnosis.code).toBe('timeout_or_network_retryable');
+    expect(timeout.retryable).toBe(true);
+
+    const fake = await runAiPing({ env: { AI_PING_PROVIDER: 'fake', AI_PING_PROMPT: 'hello' } });
+    expect(fake.ok).toBe(true);
+    const last = await readAiPingLastReport();
+    expect(last.provider).toBe('fake');
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'ai-ping-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const providers = await adminAgent.get('/api/admin/providers');
+    expect(providers.status).toBe(200);
+    expect(providers.body.lastPing.provider).toBe('fake');
+    expect(JSON.stringify(providers.body)).not.toContain('gemini-live-secret');
+    expect(JSON.stringify(providers.body)).not.toContain('claude-live-secret');
+  });
+
+  it('maintenance tools are guarded and export safe demo data', async () => {
+    await fs.promises.mkdir(path.join(config.rootDir, 'tmp'), { recursive: true });
+    const tmpFile = path.join(config.rootDir, 'tmp', `cleanup-${Date.now()}.txt`);
+    await fs.promises.writeFile(tmpFile, 'remove me');
+    const cleanup = await runLocalCleanup({ CLEANUP_TMP: 'true', CLEANUP_DRY_RUN: 'true' });
+    expect(cleanup.dryRun).toBe(true);
+    expect(fs.existsSync(tmpFile)).toBe(true);
+
+    const exported = await exportDemoData({ DEMO_EXPORT_PATH: `tmp/demo-export-${Date.now()}.json` });
+    const json = fs.readFileSync(exported.outputPath, 'utf8');
+    expect(json).not.toContain('password123');
+    expect(json).not.toContain('iVBORw0KGgoAAAANS');
+
+    await expect(runDevReset({ NODE_ENV: 'production', APP_ENV: 'production' })).rejects.toThrow(/blocked/);
+  });
+
+  it('Docker deployment files are present and ignore unsafe local artifacts', () => {
+    expect(fs.existsSync(path.join(config.rootDir, 'Dockerfile'))).toBe(true);
+    expect(fs.readFileSync(path.join(config.rootDir, 'docker-compose.yml'), 'utf8')).toContain('worker');
+    const dockerignore = fs.readFileSync(path.join(config.rootDir, '.dockerignore'), 'utf8');
+    expect(dockerignore).toContain('node_modules');
+    expect(dockerignore).toContain('.env');
+    expect(dockerignore).toContain('server/storage');
+  });
+
+  it('admin integration toolbox exposes allowlisted instructions download safely', async () => {
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'integration-toolbox-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+
+    const list = await adminAgent.get('/api/admin/integration-toolbox');
+    expect(list.status).toBe(200);
+    expect(list.body.resources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resource_id: 'external-project-admin-integration-instructions',
+          display_name: 'External Project Admin Integration Instructions',
+          download_filename: 'external_project_admin_integration_instructions.md',
+        }),
+      ]),
+    );
+
+    const download = await adminAgent.get('/admin/integration-toolbox/download/external-project-admin-integration-instructions');
+    expect(download.status).toBe(200);
+    expect(download.headers['content-disposition']).toContain('external_project_admin_integration_instructions.md');
+    expect(download.text).toContain('External Project Admin Integration Instructions');
+    expect(download.text).toContain('DEVPILOT_API_KEY=replace-with-devpilot-external-api-key');
+    expect(download.text).toContain('https://your-devpilot-domain.example');
+    expect(download.text).not.toContain('dp_ext_');
+    expect(download.text).not.toContain('sk-');
+    expect(download.text).not.toContain('AIza');
+    expect(download.text).not.toContain('ANTHROPIC_API_KEY=');
+    expect(download.text).not.toContain('OPENAI_API_KEY=');
+    expect(download.text).not.toContain('GEMINI_API_KEY=');
+    expect(download.text).not.toContain('CLAUDE_API_KEY=');
+
+    const unknown = await adminAgent.get('/admin/integration-toolbox/download/unknown-resource');
+    expect(unknown.status).toBe(404);
+
+    const traversal = await adminAgent.get('/admin/integration-toolbox/download/%2e%2e%2f.env');
+    expect(traversal.status).toBe(404);
+  });
+
+  it('admin can save DevPilot external API keys without exposing raw key', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = '';
+    const rawKey = 'dp_ext_test_key_that_should_never_echo_1234567890';
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'devpilot-key-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+
+    const userAgent = request.agent(app);
+    const userSession = await register(userAgent, 'devpilot-key-user@example.com');
+    const forbidden = await userAgent
+      .post('/api/admin/devpilot-keys')
+      .set('x-csrf-token', userSession.token)
+      .send({ source_system: 'ad-studio-ai', api_key: rawKey });
+    expect(forbidden.status).toBe(403);
+
+    const save = await adminAgent
+      .post('/api/admin/devpilot-keys')
+      .set('x-csrf-token', adminSession.token)
+      .send({ source_system: 'ad-studio-ai', label: 'AD Studio AI', api_key: rawKey });
+    expect(save.status).toBe(200);
+    expect(save.body.key).toMatchObject({
+      source_system: 'ad-studio-ai',
+      label: 'AD Studio AI',
+      status: 'active',
+    });
+    expect(JSON.stringify(save.body)).not.toContain(rawKey);
+    expect(save.body.key.key_hash).toBeUndefined();
+
+    const stored = get('SELECT * FROM devpilot_external_api_keys WHERE source_system = ?', ['ad-studio-ai']);
+    expect(stored.key_hash).toBe(hashDevPilotApiKey(rawKey));
+    expect(stored.key_hash).not.toContain(rawKey);
+
+    const list = await adminAgent.get('/api/admin/devpilot-keys');
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(list.body)).not.toContain(rawKey);
+    expect(JSON.stringify(list.body)).not.toContain(stored.key_hash);
+
+    const owner = await register(request.agent(app), 'devpilot-key-task-owner@example.com');
+    const timestamp = new Date().toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [owner.user.id, 'banner', 'pending', 'DB Key Product', 'zh-TW', '2K', 'keep', 1, 0, 0, timestamp, timestamp],
+    );
+    const handoff = await request(app)
+      .post(`/api/external/tasks/${taskId}/handoffs`)
+      .set('X-DevPilot-Source-System', 'ad-studio-ai')
+      .set('X-DevPilot-Api-Key', rawKey)
+      .send({
+        from_agent: 'ad-studio-ai',
+        to_agent: 'devpilot-reviewer',
+        reason: 'Manual review',
+        next_step: 'Review',
+        risk: 'low',
+      });
+    expect(handoff.status).toBe(201);
+    expect(handoff.body.ok).toBe(true);
+    expect(JSON.stringify(handoff.body)).not.toContain(rawKey);
+
+    const revoke = await adminAgent
+      .post(`/api/admin/devpilot-keys/${save.body.key.id}/revoke`)
+      .set('x-csrf-token', adminSession.token)
+      .send({});
+    expect(revoke.status).toBe(200);
+    expect(revoke.body.key.status).toBe('revoked');
+
+    const afterRevoke = await request(app)
+      .get('/api/external/ai-handoffs')
+      .set('X-DevPilot-Source-System', 'ad-studio-ai')
+      .set('X-DevPilot-Api-Key', rawKey);
+    expect(afterRevoke.status).toBe(403);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('external handoff auth rejects disabled, missing, unknown, and invalid keys safely', async () => {
+    const previous = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = '';
+    const disabled = await request(app).get('/api/external/ai-handoffs');
+    expect(disabled.status).toBe(403);
+    expect(disabled.body).toMatchObject({ ok: false });
+
+    config.devpilotExternalApiKeysRaw = 'external-system-a:dev-key-a';
+    const missingSource = await request(app).get('/api/external/ai-handoffs').set('X-DevPilot-Api-Key', 'dev-key-a');
+    expect(missingSource.status).toBe(403);
+    const unknown = await request(app).get('/api/external/ai-handoffs').set('X-DevPilot-Source-System', 'other').set('X-DevPilot-Api-Key', 'dev-key-a');
+    expect(unknown.status).toBe(403);
+    const invalid = await request(app).get('/api/external/ai-handoffs').set('X-DevPilot-Source-System', 'external-system-a').set('X-DevPilot-Api-Key', 'wrong-key');
+    expect(invalid.status).toBe(403);
+    expect(JSON.stringify(invalid.body)).not.toContain('wrong-key');
+    config.devpilotExternalApiKeysRaw = previous;
+  });
+
+  it('external handoff create is side-effect-free and returns safe records', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = 'external-system-a:dev-key-a';
+    const agent = request.agent(app);
+    const session = await register(agent, 'external-task-owner@example.com');
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, main_title, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'pending', 'External Product', 'External Title', 'zh-TW', '2K', 'keep', 1, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    const beforeTask = get('SELECT * FROM generation_tasks WHERE id = ?', [taskId]);
+    const beforeCostLogs = get('SELECT COUNT(*) AS count FROM ai_cost_logs').count;
+
+    const response = await request(app)
+      .post(`/api/external/tasks/${taskId}/handoffs`)
+      .set('X-DevPilot-Source-System', 'external-system-a')
+      .set('X-DevPilot-Api-Key', 'dev-key-a')
+      .set('X-DevPilot-Request-Id', 'req-1')
+      .send({
+        from_agent: 'external-system-a',
+        to_agent: 'devpilot-reviewer',
+        reason: 'Manual review needed before continuing.',
+        next_step: 'Review the external ticket and decide the handoff outcome.',
+        risk: 'low',
+        risk_level: 'medium',
+        external_ref: 'external-ticket-123',
+        actor_type: 'system',
+        actor_id: 'external-system-a',
+        secret_token: 'should-not-leak',
+        image_base64: 'A'.repeat(260),
+      });
+
+    expect(response.status).toBe(201);
+    expect(response.body.ok).toBe(true);
+    expect(response.body.idempotent_replay).toBe(false);
+    expect(response.body.execution_allowed).toBe(false);
+    expect(response.body.handoff.risk).toBe('medium');
+    expect(response.body.handoff.conversation_ref).toBe(`ai-task:${taskId}`);
+    expect(response.body.handoff.source_system).toBe('external-system-a');
+    expect(response.body.handoff.api_payload_summary).not.toHaveProperty('secret_token');
+    expect(JSON.stringify(response.body)).not.toContain('dev-key-a');
+    expect(JSON.stringify(response.body)).not.toContain('should-not-leak');
+    expect(JSON.stringify(response.body)).not.toContain('A'.repeat(260));
+    expect(get('SELECT status FROM generation_tasks WHERE id = ?', [taskId]).status).toBe(beforeTask.status);
+    expect(get('SELECT COUNT(*) AS count FROM ai_cost_logs').count).toBe(beforeCostLogs);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('external handoff create validates task and required fields with ok:false errors', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = 'external-system-a:dev-key-a';
+    const headers = { 'X-DevPilot-Source-System': 'external-system-a', 'X-DevPilot-Api-Key': 'dev-key-a' };
+    const notFound = await request(app).post('/api/external/tasks/999999/handoffs').set(headers).send({
+      from_agent: 'a',
+      to_agent: 'b',
+      reason: 'reason',
+      next_step: 'next',
+      risk: 'low',
+    });
+    expect(notFound.status).toBe(404);
+    expect(notFound.body.ok).toBe(false);
+
+    const agent = request.agent(app);
+    const session = await register(agent, 'external-validation@example.com');
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'pending', 'zh-TW', '2K', 'keep', 1, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    const invalid = await request(app).post(`/api/external/tasks/${taskId}/handoffs`).set(headers).send({ from_agent: 'a' });
+    expect(invalid.status).toBe(400);
+    expect(invalid.body.ok).toBe(false);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('external handoff idempotency replays existing records and ignores invalid payload JSON', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = 'external-system-a:dev-key-a';
+    const agent = request.agent(app);
+    const session = await register(agent, 'external-idempotency@example.com');
+    const timestamp = new Date().toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'pending', 'Idempotent Product', 'zh-TW', '2K', 'keep', 1, 0, 0, timestamp, timestamp],
+    );
+    insert(
+      `INSERT INTO ai_handoff_logs (conversation_ref, task_id, source_system, from_agent, to_agent, status, risk, reason, next_step, execution_allowed, api_payload, hidden, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [`ai-task:${taskId}`, taskId, 'external-system-a', 'bad', 'bad', 'pending', 'low', 'bad json', 'ignore', 0, '{not-json', 0, timestamp, timestamp],
+    );
+    const payload = {
+      from_agent: 'external-system-a',
+      to_agent: 'devpilot-reviewer',
+      reason: 'Manual review',
+      next_step: 'Review',
+      risk: 'medium',
+    };
+    const first = await request(app)
+      .post(`/api/external/tasks/${taskId}/handoffs`)
+      .set('X-DevPilot-Source-System', 'external-system-a')
+      .set('X-DevPilot-Api-Key', 'dev-key-a')
+      .set('X-DevPilot-Idempotency-Key', 'idem-123')
+      .send(payload);
+    expect(first.status).toBe(201);
+    const second = await request(app)
+      .post(`/api/external/tasks/${taskId}/handoffs`)
+      .set('X-DevPilot-Source-System', 'external-system-a')
+      .set('X-DevPilot-Api-Key', 'dev-key-a')
+      .set('X-DevPilot-Idempotency-Key', 'idem-123')
+      .send(payload);
+    expect(second.status).toBe(200);
+    expect(second.body.idempotent_replay).toBe(true);
+    expect(second.body.handoff.handoff_id).toBe(first.body.handoff.handoff_id);
+    expect(get('SELECT COUNT(*) AS count FROM ai_handoff_logs WHERE conversation_ref = ?', [`ai-task:${taskId}`]).count).toBe(2);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('external handoff list and detail enforce source isolation and filters', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    const previousAllowAll = config.devpilotExternalApiAllowAllSources;
+    config.devpilotExternalApiKeysRaw = 'source-a:key-a,source-b:key-b';
+    config.devpilotExternalApiAllowAllSources = false;
+    const agent = request.agent(app);
+    const session = await register(agent, 'external-isolation@example.com');
+    const createdAt = new Date().toISOString();
+    const taskA = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, main_title, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'pending', 'Alpha Product', 'Alpha Title', 'zh-TW', '2K', 'keep', 1, 0, 0, createdAt, createdAt],
+    );
+    const createFor = (source, key, externalRef, risk = 'high') => request(app)
+      .post(`/api/external/tasks/${taskA}/handoffs`)
+      .set('X-DevPilot-Source-System', source)
+      .set('X-DevPilot-Api-Key', key)
+      .send({
+        from_agent: source,
+        to_agent: 'devpilot-reviewer',
+        reason: `Review ${externalRef}`,
+        next_step: 'Manual review',
+        risk,
+        external_ref: externalRef,
+      });
+    const a = await createFor('source-a', 'key-a', 'ticket-a', 'high');
+    const b = await createFor('source-b', 'key-b', 'ticket-b', 'low');
+    expect(a.status).toBe(201);
+    expect(b.status).toBe(201);
+
+    const ownList = await request(app)
+      .get('/api/external/ai-handoffs?include_all_sources=true&source_system=source-b&q=ticket&from_agent=source-a&to_agent=devpilot-reviewer&status=pending&risk=high&external_ref=ticket-a')
+      .set('X-DevPilot-Source-System', 'source-a')
+      .set('X-DevPilot-Api-Key', 'key-a');
+    expect(ownList.status).toBe(200);
+    expect(ownList.body.handoffs).toHaveLength(1);
+    expect(ownList.body.handoffs[0].source_system).toBe('source-a');
+
+    const forbiddenDetail = await request(app)
+      .get(`/api/external/handoffs/${b.body.handoff.handoff_id}`)
+      .set('X-DevPilot-Source-System', 'source-a')
+      .set('X-DevPilot-Api-Key', 'key-a');
+    expect(forbiddenDetail.status).toBe(404);
+
+    config.devpilotExternalApiAllowAllSources = true;
+    const allSources = await request(app)
+      .get('/api/external/ai-handoffs?include_all_sources=true&source_system=source-b')
+      .set('X-DevPilot-Source-System', 'source-a')
+      .set('X-DevPilot-Api-Key', 'key-a');
+    expect(allSources.status).toBe(200);
+    expect(allSources.body.handoffs.some((handoff) => handoff.source_system === 'source-b')).toBe(true);
+    const allowedDetail = await request(app)
+      .get(`/api/external/handoffs/${b.body.handoff.handoff_id}?include_all_sources=true`)
+      .set('X-DevPilot-Source-System', 'source-a')
+      .set('X-DevPilot-Api-Key', 'key-a');
+    expect(allowedDetail.status).toBe(200);
+    expect(allowedDetail.body.handoff.api_payload).toBeUndefined();
+
+    config.devpilotExternalApiKeysRaw = previousKeys;
+    config.devpilotExternalApiAllowAllSources = previousAllowAll;
+  });
+});

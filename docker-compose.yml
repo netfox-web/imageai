@@ -1,0 +1,34 @@
+services:
+  app:
+    build: .
+    command: npm start
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3000}
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ad_studio_storage:/app/server/storage
+      - ./tmp:/app/tmp
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    build: .
+    command: npm run worker
+    env_file:
+      - .env
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - ad_studio_storage:/app/server/storage
+      - ./tmp:/app/tmp
+
+volumes:
+  ad_studio_storage:
+

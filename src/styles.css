@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  overflow-x: hidden;
+  background: #fafaf7;
+  color: #171717;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+img,
+svg,
+canvas,
+video {
+  max-width: 100%;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.field {
+  @apply w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-yellow-400 focus:ring-2 focus:ring-yellow-200;
+}
+
+.label {
+  @apply mb-1 block text-xs font-semibold text-neutral-600;
+}
+
+.btn {
+  @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+.btn-primary {
+  @apply bg-neutral-950 text-white hover:bg-neutral-800;
+}
+
+.btn-yellow {
+  @apply bg-yellow-400 text-neutral-950 hover:bg-yellow-300;
+}
+
+.btn-ghost {
+  @apply border border-neutral-200 bg-white text-neutral-800 hover:border-neutral-400;
+}
+
+.panel {
+  @apply min-w-0 rounded-xl border border-neutral-200 bg-white p-4 shadow-soft;
+}
