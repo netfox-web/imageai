@@ -265,7 +265,7 @@ export function listAdminUsers(query = {}) {
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const users = all(
     `SELECT users.id, users.name, users.email, users.role, users.status, users.credits_balance,
-            users.created_at, users.updated_at,
+            users.last_login_at, users.created_at, users.updated_at,
             (SELECT COUNT(*) FROM generation_tasks WHERE generation_tasks.user_id = users.id) AS task_count,
             (SELECT COUNT(*) FROM generation_tasks WHERE generation_tasks.user_id = users.id AND status = 'success') AS completed_task_count,
             (SELECT COUNT(*) FROM generation_tasks WHERE generation_tasks.user_id = users.id AND status = 'failed') AS failed_task_count

@@ -250,6 +250,14 @@ export class TaskService {
       formats: GenerationTask.formats(task.id),
       ai_cost_logs: GenerationTask.costLogs(task.id),
       quality_reviews: all('SELECT * FROM quality_reviews WHERE task_id = ? ORDER BY id DESC', [Number(task.id)]),
+      regeneration_requests: all('SELECT * FROM task_regeneration_requests WHERE task_id = ? ORDER BY id DESC', [Number(task.id)]),
+      handoffs: all(
+        `SELECT id AS handoff_id, source_system, external_ref, status, risk, created_at, updated_at
+         FROM ai_handoff_logs
+         WHERE task_id = ? AND hidden = 0 AND deleted_at IS NULL
+         ORDER BY id DESC`,
+        [Number(task.id)],
+      ),
     };
   }
 }

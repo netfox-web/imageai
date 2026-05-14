@@ -188,5 +188,7 @@ export function creditsSummary(userId, query = {}) {
     demoCredits: true,
     fakeProviderCost: config.fakeTaskCost,
     openaiEstimatedCostCredits: config.openaiTaskEstimatedCostCredits,
+    geminiEstimatedCostCredits: config.geminiTaskEstimatedCostCredits,
+    claudeEstimatedCostCredits: config.claudeTaskEstimatedCostCredits,
   };
 }

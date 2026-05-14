@@ -23,7 +23,8 @@ export function runEnvDiagnostics(env = process.env, config = appConfig) {
   const disk = value(env, 'FILESYSTEM_DISK', config.filesystemDisk || 'local');
   const queueDriver = value(env, 'QUEUE_DRIVER', config.queueDriver || 'local');
   const sessionSecret = value(env, 'SESSION_SECRET', config.sessionSecret || '');
-  const databaseClient = value(env, 'DATABASE_CLIENT', config.databaseClient || 'sqlite');
+  const databaseClient = String(value(env, 'DATABASE_CLIENT', config.databaseClient || 'sqlite')).toLowerCase();
+  const sqliteLike = ['sqlite', 'sqljs', 'sql.js'].includes(databaseClient);
 
   [
     ['PORT', value(env, 'PORT', config.port || 3000)],
@@ -36,9 +37,9 @@ export function runEnvDiagnostics(env = process.env, config = appConfig) {
     add(checks, current ? 'PASS' : 'WARN', key, current ? `${key} is set.` : `${key} is not set.`, `Set ${key} for staging/production.`);
   });
 
-  if (!['sqlite', 'postgres', 'mysql'].includes(databaseClient)) {
+  if (!['sqlite', 'sqljs', 'sql.js', 'postgres', 'mysql'].includes(databaseClient)) {
     add(checks, 'FAIL', 'DATABASE_CLIENT', `Unsupported DATABASE_CLIENT=${databaseClient}.`, 'Use sqlite, postgres, or mysql.');
-  } else if (databaseClient !== 'sqlite') {
+  } else if (!sqliteLike) {
     add(checks, 'WARN', 'DATABASE_CLIENT', `${databaseClient} is configured but this MVP runtime still uses sql.js locally.`, 'Plan a DB adapter migration before production.');
   } else if (isProduction && !bool(value(env, 'ALLOW_SQLITE_IN_PRODUCTION', config.allowSqliteInProduction))) {
     add(checks, 'FAIL', 'DATABASE_CLIENT', 'SQLite is blocked for production by default.', 'Use Postgres/MySQL in production, or set ALLOW_SQLITE_IN_PRODUCTION=true only for a controlled demo.');
@@ -61,8 +62,11 @@ export function runEnvDiagnostics(env = process.env, config = appConfig) {
     if (bool(value(env, 'DEBUG', config.debug))) {
       add(checks, 'FAIL', 'DEBUG', 'DEBUG=true is unsafe in production.', 'Set DEBUG=false.');
     }
+    if (queueDriver === 'worker' && sqliteLike) {
+      add(checks, 'FAIL', 'QUEUE_DRIVER', 'QUEUE_DRIVER=worker with SQLite/sql.js is unsafe because separate processes may not share live task state.', 'Use Postgres/MySQL before enabling worker mode, or use QUEUE_DRIVER=local for public trial.');
+    }
     if (queueDriver === 'local') {
-      add(checks, 'WARN', 'QUEUE_DRIVER', 'QUEUE_DRIVER=local runs work inside the web process.', 'Use QUEUE_DRIVER=worker and run npm run worker.');
+      add(checks, 'WARN', 'QUEUE_DRIVER', 'QUEUE_DRIVER=local is acceptable for single-process public trial but is not scalable.', 'Use Postgres/MySQL with QUEUE_DRIVER=worker before production traffic.');
     }
   }
 

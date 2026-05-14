@@ -28,6 +28,8 @@ export class CreditService {
       const provider = payload.provider || config.aiProvider || 'fake';
       if (provider === 'fake') return totalOutputs * Number(config.fakeTaskCost || 0);
       if (provider === 'openai') return totalOutputs * Number(config.openaiTaskEstimatedCostCredits || 0);
+      if (provider === 'gemini') return totalOutputs * Number(config.geminiTaskEstimatedCostCredits || 0);
+      if (provider === 'claude') return totalOutputs * Number(config.claudeTaskEstimatedCostCredits || 0);
       return totalOutputs * (bannerRates[imageSize] || bannerRates['2K']);
     }
 
@@ -74,7 +76,7 @@ export class CreditService {
     return balanceAfter;
   }
 
-  adminAdjust(userId, amount, note) {
+  adminAdjust(userId, amount, note, options = {}) {
     const user = User.find(userId);
     if (!user) {
       const error = new Error('找不到使用者');
@@ -86,7 +88,13 @@ export class CreditService {
       error.status = 422;
       throw error;
     }
-    const balanceAfter = Math.max(0, Number(user.credits_balance) + Number(amount));
+    const nextBalance = Number(user.credits_balance) + Number(amount);
+    if (nextBalance < 0 && !options.allowNegativeBalance) {
+      const error = new Error('Credit balance cannot become negative without explicit override.');
+      error.status = 422;
+      throw error;
+    }
+    const balanceAfter = options.allowNegativeBalance ? nextBalance : Math.max(0, nextBalance);
     run('UPDATE users SET credits_balance = ?, updated_at = ? WHERE id = ?', [balanceAfter, now(), user.id]);
     CreditTransaction.create({
       user_id: user.id,
