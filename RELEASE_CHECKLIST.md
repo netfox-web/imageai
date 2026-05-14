@@ -637,13 +637,15 @@ Production safety checks:
 ```env
 ADMIN_BOOTSTRAP_USERNAME=admin
 ADMIN_BOOTSTRAP_PASSWORD=
+ALLOW_DEFAULT_ADMIN=false
 ALLOW_DEFAULT_ADMIN_PASSWORD=false
 REQUIRE_SECURE_ADMIN_PASSWORD=true
 ```
 
-- [ ] Trial/dev may keep `admin / 1234` only as Testing only / WARN.
+- [ ] Trial/dev may keep `admin / 1234` only as Testing only / WARN when `TRIAL_MODE=true` and the environment is local/test or explicitly controlled with `ALLOW_DEFAULT_ADMIN_PASSWORD=true` / `ALLOW_DEFAULT_ADMIN=true`.
 - [ ] Production with empty admin password is No-Go.
 - [ ] Production with weak admin password is No-Go.
+- [ ] Production login rejects weak/default admin credentials even if an allow-default flag is set.
 - [ ] Weak values include `1234`, `admin`, `password`, `test`, `demo`, and `changeme`.
 - [ ] `ALLOW_DEFAULT_ADMIN_PASSWORD=true` is never accepted as a production Go condition.
 - [ ] Reports and diagnostics do not output raw admin passwords.

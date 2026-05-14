@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { now, run, transaction } from '../db/database.js';
 import { CreditTransaction, User } from '../models/index.js';
-import { config } from '../config/index.js';
+import { config, defaultAdminCredentialsAllowed } from '../config/index.js';
 
 export class AuthService {
   async register({ name, email, password, terms, invite_code }) {
@@ -56,16 +56,32 @@ export class AuthService {
   }
 
   async login({ email, password }) {
+    const passwordValue = String(password || '');
     const user = User.findWithPasswordByEmail(email);
-    if (!user || !(await bcrypt.compare(password || '', user.password))) {
+    if (!user || !(await bcrypt.compare(passwordValue, user.password))) {
       throw authError('Email 或密碼錯誤', 422);
     }
     if (user.status !== 'active') {
       throw authError('帳號已停權', 403);
     }
+    if (isWeakAdminCredentialBlocked(user, passwordValue)) {
+      throw authError(
+        'Default admin credentials are disabled outside trial mode. Configure ADMIN_BOOTSTRAP_PASSWORD and change the admin password.',
+        403,
+      );
+    }
     run('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?', [now(), now(), user.id]);
     return User.find(user.id);
   }
+}
+
+export function isWeakAdminCredentialBlocked(user, password) {
+  return Boolean(
+    user?.role === 'admin'
+      && config.admin.requireSecurePassword
+      && config.admin.isWeakPassword(password)
+      && !defaultAdminCredentialsAllowed(),
+  );
 }
 
 export function adminBootstrapPolicySummary() {

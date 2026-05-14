@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { get, insert, now, run } from './database.js';
-import { config } from '../config/index.js';
+import { config, defaultAdminCredentialsAllowed } from '../config/index.js';
 
 function upsert(table, uniqueColumns, values) {
   const timestamp = now();
@@ -233,7 +233,20 @@ function seedPromptTemplates() {
 }
 
 async function seedDemoAdmin() {
+  assertAdminBootstrapAllowed();
   ensureAdmin(config.admin.bootstrapUsername, await bcrypt.hash(config.admin.bootstrapPassword, 10), 'Admin');
+}
+
+export function assertAdminBootstrapAllowed() {
+  if (
+    config.admin.requireSecurePassword
+    && config.admin.isWeakPassword(config.admin.bootstrapPassword)
+    && !defaultAdminCredentialsAllowed()
+  ) {
+    throw new Error(
+      'Refusing to seed weak admin bootstrap password outside trial/dev mode. Configure ADMIN_BOOTSTRAP_PASSWORD.',
+    );
+  }
 }
 
 export function ensureAdmin(email, passwordHash, name = 'Admin') {
