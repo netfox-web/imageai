@@ -2889,11 +2889,20 @@ describe('AI commerce generator MVP', () => {
     config.trialMode = false;
     config.admin.bootstrapPassword = '1234';
     config.admin.bootstrapPasswordConfigured = true;
+    config.admin.allowDefaultPassword = true;
     ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
     const productionWeak = await runTrialCheck({ reportPath: `tmp/rc9-production-weak-${Date.now()}.json` });
     expect(productionWeak.ok).toBe(false);
     expect(productionWeak.checks.find((check) => check.name === 'default_admin_password_warning').status).toBe('FAIL');
     expect(productionWeak.summary.go_no_go.production_release).toBe('No-Go');
+    const productionWeakAgent = request.agent(app);
+    const productionWeakToken = await csrf(productionWeakAgent);
+    const productionWeakLogin = await productionWeakAgent
+      .post('/api/auth/login')
+      .set('x-csrf-token', productionWeakToken)
+      .send({ email: 'admin', password: '1234' });
+    expect(productionWeakLogin.status).toBe(403);
+    expect(productionWeakLogin.text).not.toContain('1234');
 
     const strongPassword = 'Str0ngAdminPass!987';
     config.admin.bootstrapPassword = strongPassword;
@@ -2906,6 +2915,13 @@ describe('AI commerce generator MVP', () => {
     expect(productionStrong.summary.go_no_go.blockers).toContain('R2/S3 live storage is not accepted');
     expect(JSON.stringify(productionStrong)).not.toContain(strongPassword);
     expect(fs.readFileSync(path.resolve(config.rootDir, productionStrong.report_path), 'utf8')).not.toContain(strongPassword);
+    const productionStrongAgent = request.agent(app);
+    const productionStrongToken = await csrf(productionStrongAgent);
+    const productionStrongLogin = await productionStrongAgent
+      .post('/api/auth/login')
+      .set('x-csrf-token', productionStrongToken)
+      .send({ email: 'admin', password: strongPassword });
+    expect(productionStrongLogin.status).toBe(200);
 
     config.nodeEnv = previous.nodeEnv;
     config.appEnv = previous.appEnv;

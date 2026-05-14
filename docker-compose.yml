@@ -6,9 +6,9 @@ services:
       - .env
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      PORT: ${PORT:-3000}
+      PORT: 3000
     ports:
-      - "${PORT:-3000}:3000"
+      - "${HOST_PORT:-3000}:3000"
     volumes:
       - ad_studio_storage:/app/server/storage
       - ./tmp:/app/tmp
@@ -20,6 +20,8 @@ services:
   worker:
     build: .
     command: npm run worker
+    profiles:
+      - worker
     env_file:
       - .env
     depends_on:
@@ -31,4 +33,3 @@ services:
 
 volumes:
   ad_studio_storage:
-

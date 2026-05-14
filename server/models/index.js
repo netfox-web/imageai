@@ -22,7 +22,7 @@ function updateRow(table, id, attributes) {
 
 export class User {
   static find(id) {
-    return get('SELECT id, name, email, google_id, role, credits_balance, status, created_at, updated_at FROM users WHERE id = ?', [
+    return get('SELECT id, name, email, google_id, role, credits_balance, status, last_login_at, created_at, updated_at FROM users WHERE id = ?', [
       Number(id),
     ]);
   }

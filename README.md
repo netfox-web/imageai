@@ -1140,11 +1140,12 @@ Secure admin bootstrap:
 ```env
 ADMIN_BOOTSTRAP_USERNAME=admin
 ADMIN_BOOTSTRAP_PASSWORD=
+ALLOW_DEFAULT_ADMIN=false
 ALLOW_DEFAULT_ADMIN_PASSWORD=false
 REQUIRE_SECURE_ADMIN_PASSWORD=true
 ```
 
-Trial/dev can temporarily use `admin / 1234` only as a clearly marked Trial Only account. Production must configure a strong `ADMIN_BOOTSTRAP_PASSWORD`; weak values include empty, `1234`, `admin`, `password`, `test`, `demo`, and `changeme`. Diagnostics and reports only show configured/weak/redacted status and never print the raw password.
+Trial/dev can temporarily use `admin / 1234` only when Trial Mode is enabled and the environment is local/test or explicitly controlled with `ALLOW_DEFAULT_ADMIN_PASSWORD=true` / `ALLOW_DEFAULT_ADMIN=true`. Production (`NODE_ENV=production` or `APP_ENV=production`) never accepts the default admin credentials and must configure a strong `ADMIN_BOOTSTRAP_PASSWORD`; weak values include empty, `1234`, `admin`, `password`, `test`, `demo`, and `changeme`. Diagnostics and reports only show configured/weak/redacted status and never print the raw password.
 
 HTTPS redirect and proxy trust:
 

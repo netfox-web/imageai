@@ -35,6 +35,20 @@ export async function runAiPing({
       error_message: 'ai:ping currently supports fake, openai, gemini, and claude.',
       http_status: null,
     };
+  } else if (providerKeyMissing(providerName, env, config)) {
+    result = {
+      ok: false,
+      skipped: true,
+      provider: providerName,
+      model: model || defaultModelForProvider(providerName, config),
+      output: '',
+      latency_ms: 0,
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      retryable: false,
+      error_code: 'missing_api_key',
+      error_message: `${providerName} API key is missing; live ping skipped safely.`,
+      http_status: null,
+    };
   } else {
     const restore = applyAiPingEnv(env, config);
     try {
@@ -80,6 +94,7 @@ export function normalizeAiPingReport({ result, providerName, model, prompt, sta
   const diagnosis = diagnoseAiPing(result);
   const safe = {
     ok: Boolean(result?.ok),
+    skipped: Boolean(result?.skipped),
     provider: result?.provider || providerName,
     model: result?.model || model || '',
     output: result?.output || '',
@@ -110,6 +125,9 @@ export function diagnoseAiPing(result = {}) {
   const status = Number(result.http_status || result.error_code || 0);
   const code = String(result.error_code || '').toLowerCase();
   const message = String(result.error_message || '').toLowerCase();
+  if (code === 'missing_api_key') {
+    return { code: 'missing_api_key', message: 'Provider API key is missing from the runtime environment; live ping was skipped safely.' };
+  }
   if (status === 401 || status === 403 || /permission|credential|unauth|api[_-]?key|invalid[_-]?x-api-key|forbidden/.test(`${code} ${message}`)) {
     return { code: 'credential_rejected', message: 'Provider rejected the credential. Check the API key, account, project, and model access.' };
   }
@@ -122,10 +140,23 @@ export function diagnoseAiPing(result = {}) {
   if (result.retryable || /abort|timeout|network|typeerror/.test(`${code} ${message}`)) {
     return { code: 'timeout_or_network_retryable', message: 'Network or timeout failure. This is retryable.' };
   }
-  if (code === 'missing_api_key') {
-    return { code: 'missing_api_key', message: 'Provider API key is missing from the runtime environment.' };
-  }
   return { code: 'provider_error', message: 'Provider ping failed. Review the safe error fields.' };
+}
+
+function providerKeyMissing(providerName, env, config) {
+  if (providerName === 'openai') return !String(env.OPENAI_API_KEY ?? config.openaiApiKey ?? '').trim();
+  if (providerName === 'gemini') {
+    return !String(env.GEMINI_API_KEY || env.GOOGLE_GENERATIVE_AI_API_KEY || env.GOOGLE_API_KEY || config.geminiApiKey || '').trim();
+  }
+  if (providerName === 'claude') return !String(env.ANTHROPIC_API_KEY || env.CLAUDE_API_KEY || config.claudeApiKey || '').trim();
+  return false;
+}
+
+function defaultModelForProvider(providerName, config) {
+  if (providerName === 'openai') return config.openaiTextModel || '';
+  if (providerName === 'gemini') return config.geminiModel || '';
+  if (providerName === 'claude') return config.claudeModel || '';
+  return '';
 }
 
 async function writeAiPingReport(reportPath, report) {

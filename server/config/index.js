@@ -9,6 +9,8 @@ const defaultSessionSecret = 'dev-session-secret-change-me';
 const weakAdminPasswords = ['1234', 'admin', 'password', 'test', 'demo', 'changeme'];
 const adminBootstrapPasswordFromEnv = process.env.ADMIN_BOOTSTRAP_PASSWORD || '';
 const adminBootstrapPassword = adminBootstrapPasswordFromEnv || '1234';
+const allowDefaultAdminPasswordEnv =
+  process.env.ALLOW_DEFAULT_ADMIN_PASSWORD ?? process.env.ALLOW_DEFAULT_ADMIN ?? 'false';
 let packageVersion = '1.0.0';
 try {
   packageVersion = JSON.parse(fs.readFileSync(path.resolve(rootDir, 'package.json'), 'utf8')).version || packageVersion;
@@ -16,6 +18,18 @@ try {
 
 export function isWeakAdminPassword(value = '') {
   return !String(value || '').trim() || weakAdminPasswords.includes(String(value || '').trim().toLowerCase());
+}
+
+export function isProductionRuntime(runtimeConfig = config) {
+  return runtimeConfig.nodeEnv === 'production' || runtimeConfig.appEnv === 'production';
+}
+
+export function defaultAdminCredentialsAllowed(runtimeConfig = config) {
+  return (
+    !isProductionRuntime(runtimeConfig)
+    && runtimeConfig.trialMode
+    && (runtimeConfig.admin.allowDefaultPassword || runtimeConfig.isLocal)
+  );
 }
 
 export const config = {
@@ -38,7 +52,7 @@ export const config = {
     bootstrapUsername: process.env.ADMIN_BOOTSTRAP_USERNAME || 'admin',
     bootstrapPassword: adminBootstrapPassword,
     bootstrapPasswordConfigured: Boolean(adminBootstrapPasswordFromEnv),
-    allowDefaultPassword: String(process.env.ALLOW_DEFAULT_ADMIN_PASSWORD || 'false') === 'true',
+    allowDefaultPassword: String(allowDefaultAdminPasswordEnv) === 'true',
     requireSecurePassword: String(process.env.REQUIRE_SECURE_ADMIN_PASSWORD || 'true') !== 'false',
     weakPasswords: weakAdminPasswords,
     isWeakPassword: isWeakAdminPassword,

@@ -56,6 +56,9 @@ export async function runStorageCheck({
 } = {}) {
   const summary = storageCheckConfig(config);
   const errors = validateStorageConfig(config);
+  if (checkPublicUrl && ['r2', 's3'].includes(summary.disk) && !summary.storagePublicUrl) {
+    errors.push('STORAGE_PUBLIC_URL is required for live R2/S3 public output verification.');
+  }
   if (errors.length) {
     const result = { ok: false, ...summary, errors, suggestions: storageSuggestions(summary.disk, 'config') };
     await writeStorageReport(reportPath, result);

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import bcrypt from 'bcryptjs';
-import { config } from '../config/index.js';
+import { config, defaultAdminCredentialsAllowed } from '../config/index.js';
 import { get } from '../db/database.js';
 import { User } from '../models/index.js';
 import { listProviders } from './AIProviderRegistry.js';
@@ -246,6 +246,7 @@ async function buildAdminPasswordCheck({ publicRuntime }) {
       default_admin_password_active: defaultAdminPasswordActive,
       allow_default_password: config.admin.allowDefaultPassword,
       require_secure_password: config.admin.requireSecurePassword,
+      default_admin_login_allowed: weak && defaultAdminCredentialsAllowed(),
       testing_only: weak && config.trialMode && !isProductionRuntime(),
       public_trial_status: weak ? 'Conditional Go' : 'Go',
       production_release_status: weak ? 'No-Go' : 'Go',

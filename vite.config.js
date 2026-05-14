@@ -6,6 +6,9 @@ const vitePort = Number(process.env.VITE_PORT || 5173);
 
 export default defineConfig({
   plugins: [react()],
+  test: {
+    exclude: ['node_modules/**', 'dist/**', 'tmp/**', 'coverage/**'],
+  },
   server: {
     port: vitePort,
     proxy: {
