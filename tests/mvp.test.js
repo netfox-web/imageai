@@ -2326,6 +2326,48 @@ describe('AI commerce generator MVP', () => {
     expect(fs.readFileSync(path.resolve(config.rootDir, reportPath), 'utf8')).not.toContain(adminPassword);
   });
 
+  it('domain check reports runtime env steps when only HTTP redirect is missing', async () => {
+    const fetchImpl = async (url) => {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'http:' && parsed.pathname === '/') {
+        return new Response('<html>app over http</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      }
+      if (parsed.pathname === '/health') {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (parsed.pathname === '/health/deep') {
+        return new Response(JSON.stringify({ ok: true, appUrl: 'https://imageai.tw', checks: { queue: { driver: 'local' } } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (parsed.pathname === '/' || parsed.pathname === '/admin') {
+        return new Response('<html>ok</html>', { status: 200, headers: { 'set-cookie': 'sid=abc; Secure; SameSite=Lax' } });
+      }
+      return new Response(JSON.stringify({ message: 'not found' }), { status: 404, headers: { 'content-type': 'application/json' } });
+    };
+
+    const report = await runDomainCheck({
+      DOMAIN_CHECK_BASE_URL: 'https://imageai.tw',
+      DOMAIN_CHECK_REPORT_PATH: `tmp/domain-http-runtime-${Date.now()}.json`,
+    }, { fetchImpl });
+
+    expect(report.ok).toBe(false);
+    expect(report.failed_step).toBe('http_redirect');
+    expect(report.steps.find((step) => step.name === 'http_redirect')?.status).toBe(200);
+    expect(report.quick_summary).toContain('HTTP reaches the app');
+    expect(report.likely_root_cause).toEqual(expect.arrayContaining([
+      'The web app runtime is missing FORCE_HTTPS=true and/or TRUST_PROXY=true.',
+    ]));
+    expect(report.next_manual_steps).toEqual(expect.arrayContaining([
+      'Set TRUST_PROXY=true and FORCE_HTTPS=true for the ad-studio-web runtime.',
+      'Restart the web process with pm2 restart ad-studio-web --update-env.',
+    ]));
+    expect(report.suggestions).toContain('Set FORCE_HTTPS=true in the web app runtime environment.');
+    expect(report.suggestions).not.toContain('Check DNS A record @ -> 211.75.219.184.');
+    expect(formatDomainCheck(report)).toContain('FORCE_HTTPS=true');
+  });
+
   it('domain check classifies TLS errors safely', async () => {
     const tlsError = new TypeError('fetch failed');
     tlsError.cause = { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' };

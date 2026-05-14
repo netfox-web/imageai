@@ -16,6 +16,14 @@ const baseSuggestions = [
   'Check NAS Web Station / reverse proxy conflict.',
 ];
 
+const httpRedirectSuggestions = [
+  'Set TRUST_PROXY=true in the web app runtime environment.',
+  'Set FORCE_HTTPS=true in the web app runtime environment.',
+  'Set APP_URL=https://imageai.tw and PUBLIC_URL=https://imageai.tw.',
+  'Restart the web process with pm2 restart ad-studio-web --update-env.',
+  'Verify curl.exe -I http://imageai.tw/ returns 308 and Location: https://imageai.tw/.',
+];
+
 const imageAiRootCauses = [
   'Missing apex A record for imageai.tw',
   'Certificate does not include imageai.tw',
@@ -91,7 +99,7 @@ function classifyFailure({ error, response, baseUrl } = {}) {
   };
 }
 
-export function buildDomainActionOutput({ ok, base_url: baseUrl, error_code: errorCode, failed_step: failedStep } = {}) {
+export function buildDomainActionOutput({ ok, base_url: baseUrl, error_code: errorCode, failed_step: failedStep, status, location } = {}) {
   const host = (() => {
     try {
       return new URL(baseUrl || '').hostname.toLowerCase();
@@ -107,6 +115,34 @@ export function buildDomainActionOutput({ ok, base_url: baseUrl, error_code: err
       next_manual_steps: [],
       commands_to_run: [
         `curl.exe -I ${(baseUrl || 'https://imageai.tw').replace(/\/+$/, '')}/health`,
+      ],
+    };
+  }
+
+  if (failedStep === 'http_redirect') {
+    const httpReachedApp = status && status >= 200 && status < 300;
+    return {
+      quick_summary: httpReachedApp
+        ? 'HTTPS is healthy and HTTP reaches the app, but HTTP returns 200 instead of redirecting to HTTPS.'
+        : `HTTPS is healthy, but HTTP is not redirecting to HTTPS${location ? `; it redirects to ${location}` : ''}.`,
+      likely_root_cause: httpReachedApp
+        ? [
+            'The web app runtime is missing FORCE_HTTPS=true and/or TRUST_PROXY=true.',
+            'The PM2 web process was not restarted with the updated public URL environment.',
+          ]
+        : [
+            'The NAS HTTP virtual host or reverse-proxy rule is not enforcing imageai.tw -> HTTPS.',
+            'The HTTP route may still be captured by a default portal before the app can redirect.',
+          ],
+      next_manual_steps: [
+        'Set TRUST_PROXY=true and FORCE_HTTPS=true for the ad-studio-web runtime.',
+        'Set APP_URL=https://imageai.tw and PUBLIC_URL=https://imageai.tw for the ad-studio-web runtime.',
+        'Restart the web process with pm2 restart ad-studio-web --update-env.',
+        'Verify curl.exe -I http://imageai.tw/ returns 308 and Location: https://imageai.tw/.',
+      ],
+      commands_to_run: [
+        'curl.exe -I http://imageai.tw/',
+        '$env:DOMAIN_CHECK_BASE_URL="https://imageai.tw"; npm run domain:check',
       ],
     };
   }
@@ -301,6 +337,7 @@ export async function runDomainCheck(env = process.env, options = {}) {
     redirects_to_https: httpRedirect.redirects_to_https || false,
     error_code: httpRedirect.error_code || null,
     error_summary: httpRedirect.error_summary || null,
+    suggestions: httpRedirect.redirects_to_https || httpRedirect.skipped ? [] : httpRedirectSuggestions,
     latency_ms: httpRedirect.latency_ms ?? null,
   });
 
@@ -332,7 +369,10 @@ export async function runDomainCheck(env = process.env, options = {}) {
     base_url: baseUrl,
     failed_step: firstFailure?.name || null,
     error_code: firstFailure?.error_code || null,
+    status: firstFailure?.status || null,
+    location: firstFailure?.location || null,
   });
+  const fallbackSuggestions = firstFailure?.name === 'http_redirect' ? [] : baseSuggestions;
   const report = redact({
     ok,
     base_url: baseUrl,
@@ -343,7 +383,7 @@ export async function runDomainCheck(env = process.env, options = {}) {
     likely_root_cause: actionOutput.likely_root_cause,
     next_manual_steps: actionOutput.next_manual_steps,
     commands_to_run: actionOutput.commands_to_run,
-    suggestions: firstFailure ? [...new Set([...(firstFailure.suggestions || []), ...baseSuggestions])] : [],
+    suggestions: firstFailure ? [...new Set([...(firstFailure.suggestions || []), ...fallbackSuggestions])] : [],
     summary,
     steps,
   }, [adminPassword]);
