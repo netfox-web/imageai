@@ -6,23 +6,48 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '../..');
 const defaultSessionSecret = 'dev-session-secret-change-me';
+const weakAdminPasswords = ['1234', 'admin', 'password', 'test', 'demo', 'changeme'];
+const adminBootstrapPasswordFromEnv = process.env.ADMIN_BOOTSTRAP_PASSWORD || '';
+const adminBootstrapPassword = adminBootstrapPasswordFromEnv || '1234';
 let packageVersion = '1.0.0';
 try {
   packageVersion = JSON.parse(fs.readFileSync(path.resolve(rootDir, 'package.json'), 'utf8')).version || packageVersion;
 } catch {}
+
+export function isWeakAdminPassword(value = '') {
+  return !String(value || '').trim() || weakAdminPasswords.includes(String(value || '').trim().toLowerCase());
+}
 
 export const config = {
   rootDir,
   appVersion: process.env.APP_VERSION || packageVersion,
   port: Number(process.env.PORT || 3000),
   appUrl: process.env.APP_URL || 'http://localhost:3000',
+  publicUrl: process.env.PUBLIC_URL || process.env.APP_URL || 'http://localhost:3000',
   corsOrigin: process.env.CORS_ORIGIN || process.env.APP_URL || '',
   nodeEnv: process.env.NODE_ENV || 'development',
   appEnv: process.env.APP_ENV || process.env.NODE_ENV || 'development',
   debug: String(process.env.DEBUG || 'false') === 'true',
+  trustProxy: String(process.env.TRUST_PROXY || 'false') === 'true',
+  forceHttps: String(process.env.FORCE_HTTPS || 'false') === 'true',
+  httpsRedirectStatus: Number(process.env.HTTPS_REDIRECT_STATUS || 308),
   authBypass: String(process.env.AUTH_BYPASS || 'false') === 'true',
   allowFakeProvider: String(process.env.ALLOW_FAKE_PROVIDER || 'false') === 'true',
   registrationEnabled: String(process.env.REGISTRATION_ENABLED || 'true') !== 'false',
+  admin: {
+    bootstrapUsername: process.env.ADMIN_BOOTSTRAP_USERNAME || 'admin',
+    bootstrapPassword: adminBootstrapPassword,
+    bootstrapPasswordConfigured: Boolean(adminBootstrapPasswordFromEnv),
+    allowDefaultPassword: String(process.env.ALLOW_DEFAULT_ADMIN_PASSWORD || 'false') === 'true',
+    requireSecurePassword: String(process.env.REQUIRE_SECURE_ADMIN_PASSWORD || 'true') !== 'false',
+    weakPasswords: weakAdminPasswords,
+    isWeakPassword: isWeakAdminPassword,
+  },
+  trialMode: String(process.env.TRIAL_MODE || 'true') === 'true',
+  trialModeMessage: process.env.TRIAL_MODE_MESSAGE || '目前為測試站，資料與圖片可能會被清理。',
+  inviteCodeEnabled: String(process.env.INVITE_CODE_ENABLED || 'false') === 'true',
+  trialInviteCode: process.env.TRIAL_INVITE_CODE || '',
+  inviteCodeLabel: process.env.INVITE_CODE_LABEL || 'Trial invite code',
   databaseClient: process.env.DATABASE_CLIENT || process.env.DB_CLIENT || process.env.DB_CONNECTION || 'sqlite',
   allowSqliteInProduction: String(process.env.ALLOW_SQLITE_IN_PRODUCTION || 'false') === 'true',
   databaseUrl: process.env.DATABASE_URL || null,
@@ -64,6 +89,8 @@ export const config = {
   freeCreditsOnSignup: Number(process.env.FREE_CREDITS_ON_SIGNUP || 100),
   fakeTaskCost: Number(process.env.FAKE_TASK_COST || 0),
   openaiTaskEstimatedCostCredits: Number(process.env.OPENAI_TASK_ESTIMATED_COST_CREDITS || 10),
+  geminiTaskEstimatedCostCredits: Number(process.env.GEMINI_TASK_ESTIMATED_COST_CREDITS || 8),
+  claudeTaskEstimatedCostCredits: Number(process.env.CLAUDE_TASK_ESTIMATED_COST_CREDITS || 8),
   minCreditsToCreateTask: Number(process.env.MIN_CREDITS_TO_CREATE_TASK || 1),
   externalAiBaseUrl: process.env.EXTERNAL_AI_BASE_URL || '',
   externalAiApiKey: process.env.EXTERNAL_AI_API_KEY || '',
@@ -86,6 +113,17 @@ export const config = {
   aiPingPrompt: process.env.AI_PING_PROMPT || 'Return exactly one short sentence: AI_PING_OK',
   aiPingReportPath: process.env.AI_PING_REPORT_PATH || '',
   aiPingTimeoutMs: Number(process.env.AI_PING_TIMEOUT_MS || 30000),
+  domainCheckBaseUrlExplicit: Boolean(process.env.DOMAIN_CHECK_BASE_URL),
+  domainCheckBaseUrl: process.env.DOMAIN_CHECK_BASE_URL || process.env.APP_URL || 'http://localhost:3000',
+  domainCheckAdminUser: process.env.DOMAIN_CHECK_ADMIN_USER || 'admin',
+  domainCheckAdminPassword: process.env.DOMAIN_CHECK_ADMIN_PASSWORD || '',
+  domainCheckReportPath: process.env.DOMAIN_CHECK_REPORT_PATH || './tmp/domain-check.json',
+  domainCheckTimeoutMs: Number(process.env.DOMAIN_CHECK_TIMEOUT_MS || 15000),
+  trialCleanupDryRun: String(process.env.TRIAL_CLEANUP_DRY_RUN || 'true') !== 'false',
+  trialCleanupOlderThanDays: Number(process.env.TRIAL_CLEANUP_OLDER_THAN_DAYS || 7),
+  trialCleanupIncludeOutputs: String(process.env.TRIAL_CLEANUP_INCLUDE_OUTPUTS || 'false') === 'true',
+  trialCleanupReportPath: process.env.TRIAL_CLEANUP_REPORT_PATH || './tmp/trial-cleanup.json',
+  allowTrialCleanupWrite: String(process.env.ALLOW_TRIAL_CLEANUP_WRITE || 'false') === 'true',
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB || 10),
   allowedImageTypes: (process.env.ALLOWED_IMAGE_TYPES || 'image/png,image/jpeg,image/webp,image/bmp')
     .split(',')

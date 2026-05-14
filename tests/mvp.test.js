@@ -48,6 +48,9 @@ import { listAuditLogs } from '../server/services/AuditService.js';
 import { resetExternalApiRateLimits } from '../server/services/ExternalApiRateLimiter.js';
 import { runRcLocalDiagnostics } from '../server/services/RcLocalDiagnostics.js';
 import { readAiPingLastReport, runAiPing } from '../server/services/AiPingDiagnostics.js';
+import { formatDomainCheck, runDomainCheck } from '../server/services/DomainDiagnostics.js';
+import { runTrialCheck } from '../server/services/TrialDiagnostics.js';
+import { assertSafeTrialPath, runTrialCleanup } from '../server/services/TrialCleanupService.js';
 import { imageLoadErrorMessage, parseTaskCostMeta } from '../src/lib/taskMeta.js';
 
 const png = Buffer.from(
@@ -1148,6 +1151,13 @@ describe('AI commerce generator MVP', () => {
     expect(formatStorageCheck(publicResult)).toContain('STORAGE_PUBLIC_URL');
     expect(missingResult.ok).toBe(false);
     expect(missingResult.errors.join(' ')).toContain('R2_ACCOUNT_ID');
+    const missingPublicUrl = await runStorageCheck({
+      config: { filesystemDisk: 'r2', storagePublicUrl: '', s3: {}, r2: { accountId: 'abc', bucket: 'bucket', accessKeyId: 'key', secretAccessKey: 'secret' } },
+      storage: fakeStorage,
+      checkPublicUrl: true,
+    });
+    expect(missingPublicUrl.ok).toBe(false);
+    expect(missingPublicUrl.errors.join(' ')).toContain('STORAGE_PUBLIC_URL');
   });
 
   it('OpenAI auto image mode uses reference edit when input exists', async () => {
@@ -1355,7 +1365,7 @@ describe('AI commerce generator MVP', () => {
     expect(runEnvDiagnostics({ NODE_ENV: 'development', AI_PROVIDER: 'fake', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', SESSION_SECRET: 'dev-secret', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).ok).toBe(true);
     expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', AUTH_BYPASS: 'true', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'openai', OPENAI_API_KEY: 'sk-test', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(false);
     expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'fake', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(false);
-    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'fake', ALLOW_FAKE_PROVIDER: 'true', ALLOW_SQLITE_IN_PRODUCTION: 'true', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(true);
+    expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'fake', ALLOW_FAKE_PROVIDER: 'true', ALLOW_SQLITE_IN_PRODUCTION: 'true', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).ok).toBe(true);
     expect(runEnvDiagnostics({ NODE_ENV: 'production', APP_ENV: 'production', SESSION_SECRET: 'strong-secret', AI_PROVIDER: 'openai', OPENAI_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'worker', PORT: '3000', APP_URL: 'https://app.test', DATABASE_URL: 'sqlite' }).checks.some((check) => check.key === 'OPENAI_API_KEY' && check.level === 'FAIL')).toBe(true);
     expect(runEnvDiagnostics({ AI_PROVIDER: 'gemini', GEMINI_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).checks.some((check) => check.key === 'GEMINI_API_KEY' && check.level === 'FAIL')).toBe(true);
     expect(runEnvDiagnostics({ AI_PROVIDER: 'claude', ANTHROPIC_API_KEY: '', FILESYSTEM_DISK: 'local', QUEUE_DRIVER: 'local', PORT: '3000', APP_URL: 'http://localhost:3000', DB_DATABASE: ':memory:' }).checks.some((check) => check.key === 'ANTHROPIC_API_KEY' && check.level === 'FAIL')).toBe(true);
@@ -1832,6 +1842,13 @@ describe('AI commerce generator MVP', () => {
 
   it('ai:ping normalizes live provider diagnostics and writes redacted reports', async () => {
     const reportPath = path.join(os.tmpdir(), `ai-ping-${Date.now()}.json`);
+    const missingOpenAi = await runAiPing({
+      env: { AI_PING_PROVIDER: 'openai', OPENAI_API_KEY: '', AI_PING_REPORT_PATH: path.join(os.tmpdir(), `ai-ping-missing-${Date.now()}.json`) },
+    });
+    expect(missingOpenAi.ok).toBe(false);
+    expect(missingOpenAi.skipped).toBe(true);
+    expect(missingOpenAi.diagnosis.code).toBe('missing_api_key');
+
     const geminiOk = await runAiPing({
       env: {
         AI_PING_PROVIDER: 'gemini',
@@ -2229,5 +2246,703 @@ describe('AI commerce generator MVP', () => {
 
     config.devpilotExternalApiKeysRaw = previousKeys;
     config.devpilotExternalApiAllowAllSources = previousAllowAll;
+  });
+
+  it('domain check writes a redacted report and handles admin login checks', async () => {
+    const reportPath = `tmp/domain-check-test-${Date.now()}.json`;
+    const adminPassword = 'domain-secret-password';
+    const fetchImpl = async (url, options = {}) => {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'http:') return new Response('', { status: 301, headers: { location: 'https://imageai.test/' } });
+      const pathName = parsed.pathname;
+      if (pathName === '/health') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+      if (pathName === '/health/deep') {
+        return new Response(JSON.stringify({ appUrl: 'https://imageai.test', checks: { queue: { driver: 'local' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (pathName === '/' || pathName === '/admin') return new Response('<html>ok</html>', { status: 200, headers: { 'set-cookie': 'sid=abc; Secure; SameSite=Lax' } });
+      if (pathName === '/api/session') {
+        return new Response(JSON.stringify({ csrfToken: 'csrf-domain' }), { status: 200, headers: { 'set-cookie': 'sid=abc; Secure; SameSite=Lax' } });
+      }
+      if (pathName === '/api/auth/login') {
+        const body = JSON.parse(options.body);
+        expect(body.password).toBe(adminPassword);
+        return new Response(JSON.stringify({ user: { email: body.email, role: 'admin' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ message: 'not found' }), { status: 404 });
+    };
+    const report = await runDomainCheck({
+      DOMAIN_CHECK_BASE_URL: 'https://imageai.test',
+      DOMAIN_CHECK_ADMIN_USER: 'admin',
+      DOMAIN_CHECK_ADMIN_PASSWORD: adminPassword,
+      DOMAIN_CHECK_REPORT_PATH: reportPath,
+    }, { fetchImpl });
+    expect(report.ok).toBe(true);
+    expect(report.summary.https_enabled).toBe(true);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(adminPassword);
+    const file = fs.readFileSync(path.resolve(config.rootDir, reportPath), 'utf8');
+    expect(file).not.toContain(adminPassword);
+  });
+
+  it('domain check classifies fetch failures and writes actionable suggestions', async () => {
+    const adminPassword = 'domain-password-never-save';
+    const reportPath = `tmp/domain-fail-${Date.now()}.json`;
+    const dnsError = new TypeError('fetch failed');
+    dnsError.cause = { code: 'ENOTFOUND' };
+    const fetchImpl = async () => { throw dnsError; };
+    const report = await runDomainCheck({
+      DOMAIN_CHECK_BASE_URL: 'https://imageai.tw',
+      DOMAIN_CHECK_ADMIN_USER: 'admin',
+      DOMAIN_CHECK_ADMIN_PASSWORD: adminPassword,
+      DOMAIN_CHECK_REPORT_PATH: reportPath,
+      DOMAIN_CHECK_TIMEOUT_MS: '20',
+    }, { fetchImpl });
+    expect(report.ok).toBe(false);
+    expect(report.failed_step).toBe('health');
+    expect(report.error_code).toBe('dns_resolve_failed');
+    expect(report.suggestions).toEqual(expect.arrayContaining(['Check DNS A record @ -> 211.75.219.184.']));
+    expect(report.quick_summary).toContain('App is healthy on IP:3050');
+    expect(report.likely_root_cause).toEqual(expect.arrayContaining([
+      'Missing apex A record for imageai.tw',
+      'Certificate does not include imageai.tw',
+      'Reverse proxy host imageai.tw is not matching app destination',
+    ]));
+    expect(report.next_manual_steps).toEqual(expect.arrayContaining([
+      'Add A record @ -> 211.75.219.184 with DNS only',
+      'Create Synology reverse proxy imageai.tw:443 -> http://127.0.0.1:3050',
+      "Issue and assign Let's Encrypt certificate for imageai.tw and www.imageai.tw",
+    ]));
+    expect(report.commands_to_run).toEqual(expect.arrayContaining([
+      'nslookup imageai.tw',
+      'Test-NetConnection imageai.tw -Port 443',
+      'curl.exe -I https://imageai.tw/health',
+    ]));
+    const formatted = formatDomainCheck(report);
+    expect(formatted).toContain('quick_summary');
+    expect(formatted).toContain('likely_root_cause');
+    expect(formatted).toContain('next_manual_steps');
+    expect(formatted).toContain('commands_to_run');
+    expect(JSON.stringify(report)).not.toContain(adminPassword);
+    expect(fs.readFileSync(path.resolve(config.rootDir, reportPath), 'utf8')).not.toContain(adminPassword);
+  });
+
+  it('domain check classifies TLS errors safely', async () => {
+    const tlsError = new TypeError('fetch failed');
+    tlsError.cause = { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' };
+    const report = await runDomainCheck({
+      DOMAIN_CHECK_BASE_URL: 'https://imageai.tw',
+      DOMAIN_CHECK_REPORT_PATH: `tmp/domain-tls-${Date.now()}.json`,
+      DOMAIN_CHECK_TIMEOUT_MS: '20',
+    }, { fetchImpl: async () => { throw tlsError; } });
+    expect(report.error_code).toBe('tls_certificate_failed');
+    expect(JSON.stringify(report)).not.toContain('UNABLE_TO_VERIFY_LEAF_SIGNATURE'.repeat(20));
+  });
+
+  it('env check blocks worker queue with sqlite/sqljs in production and warns for local queue', () => {
+    const workerSqlite = runEnvDiagnostics({
+      NODE_ENV: 'production',
+      APP_ENV: 'production',
+      PORT: '3000',
+      APP_URL: 'https://imageai.tw',
+      SESSION_SECRET: 'strong-secret-value-for-test',
+      AI_PROVIDER: 'openai',
+      OPENAI_API_KEY: 'present',
+      FILESYSTEM_DISK: 'local',
+      QUEUE_DRIVER: 'worker',
+      DATABASE_CLIENT: 'sqlite',
+      ALLOW_SQLITE_IN_PRODUCTION: 'true',
+    });
+    expect(workerSqlite.ok).toBe(false);
+    expect(workerSqlite.checks.some((check) => check.key === 'QUEUE_DRIVER' && check.level === 'FAIL')).toBe(true);
+
+    const localQueue = runEnvDiagnostics({
+      NODE_ENV: 'production',
+      APP_ENV: 'production',
+      PORT: '3000',
+      APP_URL: 'https://imageai.tw',
+      SESSION_SECRET: 'strong-secret-value-for-test',
+      AI_PROVIDER: 'openai',
+      OPENAI_API_KEY: 'present',
+      FILESYSTEM_DISK: 'local',
+      QUEUE_DRIVER: 'local',
+      DATABASE_CLIENT: 'sqlite',
+      ALLOW_SQLITE_IN_PRODUCTION: 'true',
+    });
+    expect(localQueue.checks.some((check) => check.key === 'QUEUE_DRIVER' && check.level === 'WARN')).toBe(true);
+  });
+
+  it('admin system includes domain readiness and queue/db readiness warnings', async () => {
+    await runDomainCheck({
+      DOMAIN_CHECK_BASE_URL: 'https://imageai.tw',
+      DOMAIN_CHECK_REPORT_PATH: './tmp/domain-check.json',
+      DOMAIN_CHECK_TIMEOUT_MS: '20',
+    }, {
+      fetchImpl: async () => {
+        const err = new TypeError('fetch failed');
+        err.cause = { code: 'ECONNREFUSED' };
+        throw err;
+      },
+    });
+    const agent = request.agent(app);
+    const session = await register(agent, 'admin-system-domain@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', session.user.id]);
+    const response = await agent.get('/api/admin/system');
+    expect(response.status).toBe(200);
+    expect(response.body.domainReadiness.status).toBe('failed');
+    expect(response.body.domainReadiness.error_code).toBe('tcp_connect_failed');
+    expect(response.body.domainFix.title).toBe('Domain / HTTPS Troubleshooting');
+    expect(response.body.domainFix.failed_step).toBe('health');
+    expect(response.body.domainFix.likely_root_cause).toContain('Missing apex A record for imageai.tw');
+    expect(response.body.domainFix.next_manual_steps).toContain('Create Synology reverse proxy imageai.tw:443 -> http://127.0.0.1:3050');
+    const appSource = fs.readFileSync(path.join(config.rootDir, 'src/App.jsx'), 'utf8');
+    expect(appSource).toContain('Domain / HTTPS Troubleshooting');
+    expect(appSource).toContain('NAS_DOMAIN_FIX.md');
+    expect(response.body.databaseClient).toBeTruthy();
+    expect(response.body.publicUrl).toBeTruthy();
+  });
+
+  it('README and docker compose document public trial queue guidance', () => {
+    const readme = fs.readFileSync(path.join(config.rootDir, 'README.md'), 'utf8');
+    const checklist = fs.readFileSync(path.join(config.rootDir, 'RELEASE_CHECKLIST.md'), 'utf8');
+    const nasGuide = fs.readFileSync(path.join(config.rootDir, 'NAS_DOMAIN_FIX.md'), 'utf8');
+    const compose = fs.readFileSync(path.join(config.rootDir, 'docker-compose.yml'), 'utf8');
+    expect(readme).toContain('imageai.tw DNS / HTTPS Troubleshooting');
+    expect(readme).toContain('NAS_DOMAIN_FIX.md');
+    expect(checklist).toContain('DNS only / gray cloud');
+    expect(nasGuide).toContain('Type | A');
+    expect(nasGuide).toContain('211.75.219.184');
+    expect(nasGuide).not.toMatch(/sk-[A-Za-z0-9_-]{8,}/);
+    expect(nasGuide).not.toMatch(/AIza[0-9A-Za-z_-]{20,}/);
+    expect(readme).toContain('QUEUE_DRIVER=local');
+    expect(checklist).toContain('Queue / DB Readiness');
+    expect(compose).toContain('profiles:');
+    expect(compose).toContain('worker');
+    expect(readme).not.toMatch(/sk-[A-Za-z0-9]/);
+  });
+
+  it('domain manual guide prints DNS A guidance without network or credentials', () => {
+    const result = spawnSync(process.execPath, ['server/cli/domain-manual-guide.js'], {
+      cwd: config.rootDir,
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('DNS A @ -> 211.75.219.184');
+    expect(result.stdout).toContain('DNS only / gray cloud');
+    expect(result.stdout).toContain('NAS_DOMAIN_FIX.md');
+    expect(result.stdout).not.toMatch(/sk-[A-Za-z0-9_-]{8,}/);
+  });
+
+  it('admin system reports default password warnings and supports password change', async () => {
+    ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
+    const agent = request.agent(app);
+    let token = await csrf(agent);
+    const login = await agent.post('/api/auth/login').set('x-csrf-token', token).send({ email: 'admin', password: '1234' });
+    expect(login.status).toBe(200);
+    token = (await agent.get('/api/session')).body.csrfToken;
+    const system = await agent.get('/api/admin/system');
+    expect(system.status).toBe(200);
+    expect(system.body.securityWarnings.some((warning) => warning.code === 'default_admin_password')).toBe(true);
+    const previousAppUrl = config.appUrl;
+    const previousPublicUrl = config.publicUrl;
+    config.appUrl = 'https://imageai.tw';
+    config.publicUrl = 'https://imageai.tw';
+    const publicSystem = await agent.get('/api/admin/system');
+    const defaultWarning = publicSystem.body.securityWarnings.find((warning) => warning.code === 'default_admin_password');
+    expect(defaultWarning.blocking).toBe(false);
+    expect(defaultWarning.testing_only).toBe(true);
+    expect(defaultWarning.message).toContain('Testing only');
+    config.appUrl = previousAppUrl;
+    config.publicUrl = previousPublicUrl;
+
+    const changed = await agent
+      .post('/api/auth/change-password')
+      .set('x-csrf-token', token)
+      .send({ current_password: '1234', new_password: 'new-admin-pass', confirm_password: 'new-admin-pass' });
+    expect(changed.status).toBe(200);
+    await agent.post('/api/auth/logout').set('x-csrf-token', token);
+
+    const nextAgent = request.agent(app);
+    const nextToken = await csrf(nextAgent);
+    const oldLogin = await nextAgent.post('/api/auth/login').set('x-csrf-token', nextToken).send({ email: 'admin', password: '1234' });
+    expect(oldLogin.status).not.toBe(200);
+    const newLogin = await nextAgent.post('/api/auth/login').set('x-csrf-token', nextToken).send({ email: 'admin', password: 'new-admin-pass' });
+    expect(newLogin.status).toBe(200);
+    const changedSystem = await nextAgent.get('/api/admin/system');
+    expect(changedSystem.body.securityWarnings.some((warning) => warning.code === 'default_admin_password')).toBe(false);
+  });
+
+  it('admin provider playground runs fake text safely and audits the action', async () => {
+    const agent = request.agent(app);
+    const session = await register(agent, 'provider-playground-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', session.user.id]);
+    const token = (await agent.get('/api/session')).body.csrfToken;
+    const response = await agent
+      .post('/api/admin/provider-playground')
+      .set('x-csrf-token', token)
+      .send({ provider: 'fake', capability: 'chat', prompt: 'Return exactly: FAKE_OK' });
+    expect(response.status).toBe(200);
+    expect(response.body.provider).toBe('fake');
+    expect(response.body.output).toBe('FAKE_OK');
+    const audit = listAuditLogs({ action: 'provider_playground_run', limit: 5 }).logs;
+    expect(audit.length).toBeGreaterThan(0);
+    expect(JSON.stringify(audit)).not.toContain('OPENAI_API_KEY');
+  });
+
+  it('admin DevPilot dashboard lists and reviews handoffs without exposing raw payload', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = 'source-rc4:key-rc4';
+    const agent = request.agent(app);
+    const session = await register(agent, 'devpilot-dashboard-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', session.user.id]);
+    const timestamp = new Date().toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.user.id, 'banner', 'pending', 'RC4 Product', 'zh-TW', '2K', 'keep', 1, 0, 0, timestamp, timestamp],
+    );
+    const created = await request(app)
+      .post(`/api/external/tasks/${taskId}/handoffs`)
+      .set('X-DevPilot-Source-System', 'source-rc4')
+      .set('X-DevPilot-Api-Key', 'key-rc4')
+      .send({ from_agent: 'source-rc4', to_agent: 'devpilot-reviewer', reason: 'Review', next_step: 'Review now', risk: 'low', external_ref: 'rc4-ticket' });
+    expect(created.status).toBe(201);
+
+    const dashboard = await agent.get('/api/admin/devpilot?source_system=source-rc4');
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.recentHandoffs).toHaveLength(1);
+    expect(dashboard.body.recentHandoffs[0].api_payload).toBeUndefined();
+    expect(JSON.stringify(dashboard.body)).not.toContain('key-rc4');
+
+    const token = (await agent.get('/api/session')).body.csrfToken;
+    const reviewed = await agent.post(`/api/admin/handoffs/${created.body.handoff.handoff_id}/reviewed`).set('x-csrf-token', token).send({ note: 'ok' });
+    expect(reviewed.status).toBe(200);
+    expect(reviewed.body.handoff.api_payload_summary.admin_review.reviewed).toBe(true);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('RC5 task actions retry, duplicate, regeneration, and UI handoff stay safe', async () => {
+    const previousKeys = config.devpilotExternalApiKeysRaw;
+    config.devpilotExternalApiKeysRaw = 'source-rc5:key-rc5';
+    const ownerAgent = request.agent(app);
+    const ownerSession = await register(ownerAgent, 'rc5-actions-owner@example.com');
+    const taskResponse = await createBannerTask(ownerAgent, ownerSession.token);
+    expect(taskResponse.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [taskResponse.body.task_id])?.status === 'success');
+    const output = get("SELECT * FROM task_images WHERE task_id = ? AND type = 'output'", [taskResponse.body.task_id]);
+    expect(output).toBeTruthy();
+
+    const duplicate = await ownerAgent
+      .post(`/api/tasks/${taskResponse.body.task_id}/duplicate`)
+      .set('x-csrf-token', ownerSession.token)
+      .send({});
+    expect(duplicate.status).toBe(201);
+    expect(duplicate.body.copied_from_task_id).toBe(taskResponse.body.task_id);
+    expect(duplicate.body.outputs_copied).toBe(false);
+    expect(get("SELECT COUNT(*) AS count FROM task_images WHERE task_id = ? AND type = 'output'", [duplicate.body.task_id]).count).toBe(0);
+    expect(get('SELECT product_name FROM generation_tasks WHERE id = ?', [duplicate.body.task_id]).product_name).toBe(
+      get('SELECT product_name FROM generation_tasks WHERE id = ?', [taskResponse.body.task_id]).product_name,
+    );
+
+    const regeneration = await ownerAgent
+      .post(`/api/tasks/${taskResponse.body.task_id}/regenerations`)
+      .set('x-csrf-token', ownerSession.token)
+      .send({ task_image_id: output.id, reason: 'try another crop' });
+    expect(regeneration.status).toBe(201);
+    expect(regeneration.body.regeneration.status).toBe('requested');
+    expect(regeneration.body.regeneration.metadata_json).toContain('requested_by');
+    expect(regeneration.body.regeneration.output_url).toContain('/storage/');
+
+    const handoff = await ownerAgent
+      .post(`/api/tasks/${taskResponse.body.task_id}/devpilot-handoff`)
+      .set('x-csrf-token', ownerSession.token)
+      .send({ reason: 'review this task' });
+    expect(handoff.status).toBe(201);
+    expect(handoff.body.execution_allowed).toBe(false);
+    expect(handoff.body.handoff.external_ref).toContain(`task-${taskResponse.body.task_id}-`);
+    expect(JSON.stringify(handoff.body)).not.toContain('key-rc5');
+
+    const failedTaskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, retry_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [ownerSession.user.id, 'banner', 'failed', 'zh-TW', '2K', 'keep', 1, 0, 0, 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    const retry = await ownerAgent.post(`/api/tasks/${failedTaskId}/retry`).set('x-csrf-token', ownerSession.token).send({});
+    expect(retry.status).toBe(200);
+    expect(retry.body.task.retry_count).toBe(1);
+    expect(listAuditLogs({ action: 'task_retry' }).logs.length).toBeGreaterThan(0);
+
+    const otherAgent = request.agent(app);
+    const otherSession = await register(otherAgent, 'rc5-actions-other@example.com');
+    const denied = await otherAgent.post(`/api/tasks/${failedTaskId}/retry`).set('x-csrf-token', otherSession.token).send({});
+    expect(denied.status).toBe(403);
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'rc5-actions-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    run("UPDATE generation_tasks SET status = 'failed' WHERE id = ?", [failedTaskId]);
+    const adminRetry = await adminAgent.post(`/api/admin/tasks/${failedTaskId}/retry`).set('x-csrf-token', adminSession.token).send({});
+    expect(adminRetry.status).toBe(200);
+    expect(adminRetry.body.task.retry_count).toBe(2);
+    config.devpilotExternalApiKeysRaw = previousKeys;
+  });
+
+  it('RC5 assets support share links, batch actions, CSV export, and public redaction', async () => {
+    const agent = request.agent(app);
+    const session = await register(agent, 'rc5-assets@example.com');
+    const task = await createBannerTask(agent, session.token);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [task.body.task_id])?.status === 'success');
+    const assets = await agent.get('/api/assets?type=output');
+    const asset = assets.body.assets.find((item) => item.task_id === task.body.task_id);
+    expect(asset).toBeTruthy();
+
+    const batch = await agent
+      .post('/api/assets/batch')
+      .set('x-csrf-token', session.token)
+      .send({ ids: [asset.id], action: 'tag', tags: 'hero,trial' });
+    expect(batch.status).toBe(200);
+    expect(batch.body.updated).toBe(1);
+    expect((await agent.get('/api/assets?type=output&q=hero')).body.assets.some((item) => item.id === asset.id)).toBe(true);
+
+    const csv = await agent.get(`/api/assets.csv?ids=${asset.id}`);
+    expect(csv.status).toBe(200);
+    expect(csv.text).toContain('task_id');
+    expect(csv.text).not.toContain('password');
+    expect(csv.text).not.toContain('api_key');
+
+    const share = await agent.post(`/api/assets/${asset.id}/share`).set('x-csrf-token', session.token).send({});
+    expect(share.status).toBe(200);
+    expect(share.body.share.token.length).toBeGreaterThan(20);
+    const publicJson = await request(app).get(`/api/share/${share.body.share.token}`);
+    expect(publicJson.status).toBe(200);
+    expect(publicJson.body.asset.task_id).toBe(task.body.task_id);
+    expect(JSON.stringify(publicJson.body)).not.toContain(session.user.email);
+    expect(JSON.stringify(publicJson.body)).not.toContain('raw_response');
+    const publicHtml = await request(app).get(`/share/${share.body.share.token}`);
+    expect(publicHtml.status).toBe(200);
+    expect(publicHtml.text).toContain(`/share/${share.body.share.token}/image`);
+    expect(publicHtml.text).not.toContain(session.user.email);
+    const revoke = await agent.post(`/api/assets/${asset.id}/share/revoke`).set('x-csrf-token', session.token).send({});
+    expect(revoke.status).toBe(200);
+    expect((await request(app).get(`/api/share/${share.body.share.token}`)).status).toBe(404);
+  });
+
+  it('RC5 admin credits, users, security headers, DevPilot handoff filters, and trial check are safe', async () => {
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'rc5-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    run("UPDATE users SET role = 'user' WHERE role = 'admin' AND id != ?", [adminSession.user.id]);
+    const userAgent = request.agent(app);
+    const userSession = await register(userAgent, 'rc5-credit-user@example.com');
+
+    const missingReason = await adminAgent
+      .post(`/api/admin/users/${userSession.user.id}/adjust-credits`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ amount: 10, note: '' });
+    expect(missingReason.status).toBe(422);
+    const negative = await adminAgent
+      .post(`/api/admin/users/${userSession.user.id}/adjust-credits`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ amount: -9999, note: 'too much' });
+    expect(negative.status).toBe(422);
+    const adjust = await adminAgent
+      .post(`/api/admin/users/${userSession.user.id}/adjust-credits`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ amount: 10, note: 'trial topup' });
+    expect(adjust.status).toBe(200);
+    const credits = await adminAgent.get('/api/admin/credits');
+    expect(credits.status).toBe(200);
+    expect(credits.body.ledger.some((tx) => tx.note === 'trial topup')).toBe(true);
+    expect((await adminAgent.get('/api/admin/credits.csv')).text).not.toContain('password');
+
+    const disableLastAdmin = await adminAgent
+      .post(`/api/admin/users/${adminSession.user.id}/status`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ status: 'suspended' });
+    expect(disableLastAdmin.status).toBe(422);
+    const suspended = await adminAgent
+      .post(`/api/admin/users/${userSession.user.id}/status`)
+      .set('x-csrf-token', adminSession.token)
+      .send({ status: 'suspended' });
+    expect(suspended.status).toBe(200);
+    const disabledLoginAgent = request.agent(app);
+    const disabledToken = await csrf(disabledLoginAgent);
+    const disabledLogin = await disabledLoginAgent
+      .post('/api/auth/login')
+      .set('x-csrf-token', disabledToken)
+      .send({ email: 'rc5-credit-user@example.com', password: 'password123' });
+    expect(disabledLogin.status).toBe(403);
+
+    const health = await request(app).get('/health');
+    expect(health.headers['x-content-type-options']).toBe('nosniff');
+    expect(health.headers['x-frame-options']).toBe('SAMEORIGIN');
+    expect(health.headers['referrer-policy']).toBe('same-origin');
+    expect(health.headers['content-security-policy']).toContain("default-src 'self'");
+
+    const suite = await adminAgent.post('/api/admin/devpilot/test-suite').set('x-csrf-token', adminSession.token).send({});
+    expect(suite.status).toBe(200);
+    expect(suite.body.raw_key_returned).toBe(false);
+    expect(JSON.stringify(suite.body)).not.toContain('key_hash');
+    const handoffs = await adminAgent.get('/api/admin/devpilot/handoffs?include_test=1');
+    expect(handoffs.status).toBe(200);
+    expect(handoffs.body.handoffs.every((handoff) => handoff.safe_payload_summary)).toBe(true);
+
+    const trial = await runTrialCheck({ reportPath: `tmp/trial-check-test-${Date.now()}.json` });
+    expect(trial.checks.some((check) => check.name === 'provider_registry_summary')).toBe(true);
+    expect(trial.checks.some((check) => check.name === 'queue_mode_check' && check.status === 'WARN')).toBe(true);
+    expect(trial.checks.some((check) => check.name === 'public_domain_health' && check.status === 'SKIP')).toBe(true);
+    expect(trial.summary.devpilot_key_count).toBeDefined();
+    expect(JSON.stringify(trial)).not.toMatch(/sk-[A-Za-z0-9_-]{8,}/);
+    expect(fs.existsSync(path.resolve(config.rootDir, trial.report_path))).toBe(true);
+
+    const previousNodeEnv = config.nodeEnv;
+    const previousAppEnv = config.appEnv;
+    const previousAppUrl = config.appUrl;
+    config.nodeEnv = 'production';
+    config.appEnv = 'production';
+    config.appUrl = 'https://imageai.tw';
+    ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
+    const productionTrial = await runTrialCheck({ reportPath: `tmp/trial-check-production-${Date.now()}.json` });
+    expect(productionTrial.ok).toBe(false);
+    expect(productionTrial.summary.go_no_go.public_trial).toBe('Conditional Go');
+    expect(productionTrial.summary.go_no_go.production_release).toBe('No-Go');
+    expect(productionTrial.checks.find((check) => check.name === 'default_admin_password_warning').status).toBe('FAIL');
+    config.nodeEnv = previousNodeEnv;
+    config.appEnv = previousAppEnv;
+    config.appUrl = previousAppUrl;
+  });
+
+  it('RC8 trial banner, invite gate, feedback, analytics, share, and cleanup stay safe', async () => {
+    const previousInviteEnabled = config.inviteCodeEnabled;
+    const previousInviteCode = config.trialInviteCode;
+    const previousInviteLabel = config.inviteCodeLabel;
+    const previousTrialMode = config.trialMode;
+    const previousTrialMessage = config.trialModeMessage;
+    const previousNodeEnv = config.nodeEnv;
+    const previousAppEnv = config.appEnv;
+    config.trialMode = true;
+    config.trialModeMessage = '目前為測試站，資料與圖片可能會被清理。';
+    config.inviteCodeEnabled = true;
+    config.trialInviteCode = 'trial-ok';
+    config.inviteCodeLabel = 'Trial invite code';
+
+    const bootstrap = await request(app).get('/api/bootstrap');
+    expect(bootstrap.body.trialMode.enabled).toBe(true);
+    expect(bootstrap.body.registration.invite_code_enabled).toBe(true);
+    expect(JSON.stringify(bootstrap.body)).not.toContain('trial-ok');
+    const appSource = fs.readFileSync(path.resolve(config.rootDir, 'src/App.jsx'), 'utf8');
+    expect(appSource).toContain('Testing only');
+    expect(appSource).toContain('Trial invite code');
+
+    const missingAgent = request.agent(app);
+    let token = await csrf(missingAgent);
+    const missing = await missingAgent
+      .post('/api/auth/register')
+      .set('x-csrf-token', token)
+      .send({ name: 'Trial User', email: 'invite-missing@example.com', password: 'password123', terms: true });
+    expect(missing.status).toBe(403);
+    expect(missing.text).not.toContain('trial-ok');
+
+    const wrongAgent = request.agent(app);
+    token = await csrf(wrongAgent);
+    const wrong = await wrongAgent
+      .post('/api/auth/register')
+      .set('x-csrf-token', token)
+      .send({ name: 'Trial User', email: 'invite-wrong@example.com', password: 'password123', terms: true, invite_code: 'wrong' });
+    expect(wrong.status).toBe(403);
+
+    const invitedAgent = request.agent(app);
+    token = await csrf(invitedAgent);
+    const invited = await invitedAgent
+      .post('/api/auth/register')
+      .set('x-csrf-token', token)
+      .send({ name: 'Trial User', email: 'invite-ok@example.com', password: 'password123', terms: true, invite_code: 'trial-ok' });
+    expect(invited.status).toBe(201);
+    expect(JSON.stringify(invited.body)).not.toContain('trial-ok');
+    config.inviteCodeEnabled = false;
+    const openSession = await register(request.agent(app), 'invite-disabled@example.com');
+    expect(openSession.user.email).toBe('invite-disabled@example.com');
+
+    const feedbackToken = (await invitedAgent.get('/api/session')).body.csrfToken;
+    const feedback = await invitedAgent
+      .post('/api/feedback')
+      .set('x-csrf-token', feedbackToken)
+      .send({
+        type: 'quality',
+        severity: 'high',
+        title: 'Image issue',
+        description: 'The output has api_key=sk-secretvalue1234567890 and should redact it.',
+        task_id: 1,
+        asset_url: '/share/example/image',
+      });
+    expect(feedback.status).toBe(201);
+    expect(feedback.body.report.description).toContain('[redacted_secret]');
+
+    const adminAgent = request.agent(app);
+    const adminSession = await register(adminAgent, 'rc8-admin@example.com');
+    run('UPDATE users SET role = ? WHERE id = ?', ['admin', adminSession.user.id]);
+    const adminToken = (await adminAgent.get('/api/session')).body.csrfToken;
+    const adminFeedback = await adminAgent.get('/api/admin/feedback?status=open');
+    expect(adminFeedback.body.reports.some((report) => report.id === feedback.body.report.id)).toBe(true);
+    const update = await adminAgent
+      .post(`/api/admin/feedback/${feedback.body.report.id}`)
+      .set('x-csrf-token', adminToken)
+      .send({ status: 'reviewing', admin_notes: 'triaged' });
+    expect(update.body.report.status).toBe('reviewing');
+    const userFeedbackList = await invitedAgent.get('/api/admin/feedback');
+    expect(userFeedbackList.status).toBe(403);
+
+    const oldDate = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const taskId = insert(
+      `INSERT INTO generation_tasks (user_id, tool_type, status, product_name, language, image_size, logo_mode, quantity, credits_cost, failure_refunded, error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [invited.body.user.id, 'banner', 'failed', 'RC8 Product', 'zh-TW', '2K', 'keep', 1, 0, 0, 'old failure', oldDate, oldDate],
+    );
+    const imageId = insert(
+      `INSERT INTO task_images (task_id, type, storage_path, mime_type, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [taskId, 'output', 'outputs/rc8-output.png', 'image/png', oldDate, oldDate],
+    );
+    insert(
+      `INSERT INTO asset_metadata (task_image_id, user_id, favorite, archived, tags, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [imageId, invited.body.user.id, 0, 1, 'trial', 'archived', oldDate, oldDate],
+    );
+    insert(
+      `INSERT INTO ai_handoff_logs (conversation_ref, task_id, source_system, from_agent, to_agent, status, risk, reason, next_step, execution_allowed, hidden, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ['rc8', taskId, 'test-suite', 'ad-studio-ai', 'devpilot', 'pending', 'low', 'test', 'none', 0, 1, oldDate, oldDate],
+    );
+    const share = await invitedAgent.post(`/api/assets/${imageId}/share`).set('x-csrf-token', feedbackToken).send({});
+    expect(share.status).toBe(200);
+    const sharePage = await request(app).get(share.body.share.share_url);
+    expect(sharePage.status).toBe(200);
+    expect(sharePage.text).toContain('由 imageai.tw 生成');
+    expect(sharePage.text).not.toContain('invite-ok@example.com');
+    expect(sharePage.text).not.toContain('raw_response');
+    const revoke = await invitedAgent.post(`/api/assets/${imageId}/share/revoke`).set('x-csrf-token', feedbackToken).send({});
+    expect(revoke.status).toBe(200);
+    expect((await request(app).get(share.body.share.share_url)).status).toBe(404);
+    expect((await request(app).get('/share/not-a-real-token-000')).status).toBe(404);
+
+    const trialAnalytics = await adminAgent.get('/api/admin/trial');
+    expect(trialAnalytics.status).toBe(200);
+    expect(trialAnalytics.body.feedback_open_count).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(trialAnalytics.body)).not.toMatch(/sk-[A-Za-z0-9_-]{8,}/);
+
+    const cleanup = runTrialCleanup({
+      dryRun: true,
+      olderThanDays: 7,
+      reportPath: `tmp/trial-cleanup-test-${Date.now()}.json`,
+    });
+    expect(cleanup.dry_run).toBe(true);
+    expect(cleanup.selected.old_failed_tasks.some((task) => task.id === taskId)).toBe(true);
+    expect(get('SELECT deleted_at FROM generation_tasks WHERE id = ?', [taskId]).deleted_at).toBeNull();
+    expect(JSON.stringify(cleanup)).not.toMatch(/sk-[A-Za-z0-9_-]{8,}/);
+    expect(() => assertSafeTrialPath(path.resolve(config.rootDir, 'README.md'))).toThrow(/unsafe trial cleanup path|protected/);
+    config.nodeEnv = 'production';
+    config.appEnv = 'production';
+    expect(() => runTrialCleanup({ dryRun: false, allowWrite: false })).toThrow(/blocked in production/);
+    config.nodeEnv = previousNodeEnv;
+    config.appEnv = previousAppEnv;
+
+    const trial = await runTrialCheck({ reportPath: `tmp/rc8-trial-check-${Date.now()}.json` });
+    expect(trial.checks.find((check) => check.name === 'trial_mode').status).toBe('PASS');
+    expect(trial.checks.find((check) => check.name === 'default_admin_password_warning').status).toBe('WARN');
+    expect(trial.ok).toBe(true);
+
+    config.inviteCodeEnabled = previousInviteEnabled;
+    config.trialInviteCode = previousInviteCode;
+    config.inviteCodeLabel = previousInviteLabel;
+    config.trialMode = previousTrialMode;
+    config.trialModeMessage = previousTrialMessage;
+  });
+
+  it('RC9 admin bootstrap gates classify trial and production password readiness safely', async () => {
+    const previous = {
+      nodeEnv: config.nodeEnv,
+      appEnv: config.appEnv,
+      trialMode: config.trialMode,
+      bootstrapUsername: config.admin.bootstrapUsername,
+      bootstrapPassword: config.admin.bootstrapPassword,
+      bootstrapPasswordConfigured: config.admin.bootstrapPasswordConfigured,
+      allowDefaultPassword: config.admin.allowDefaultPassword,
+      requireSecurePassword: config.admin.requireSecurePassword,
+    };
+
+    config.nodeEnv = 'development';
+    config.appEnv = 'development';
+    config.trialMode = true;
+    config.admin.bootstrapUsername = 'admin';
+    config.admin.bootstrapPassword = '1234';
+    config.admin.bootstrapPasswordConfigured = false;
+    config.admin.allowDefaultPassword = false;
+    config.admin.requireSecurePassword = true;
+    ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
+    const trial = await runTrialCheck({ reportPath: `tmp/rc9-trial-password-${Date.now()}.json` });
+    const trialPasswordCheck = trial.checks.find((check) => check.name === 'default_admin_password_warning');
+    expect(trialPasswordCheck.status).toBe('WARN');
+    expect(trial.summary.go_no_go.public_trial).toBe('Conditional Go');
+    expect(trial.summary.go_no_go.production_release).toBe('No-Go');
+
+    config.nodeEnv = 'production';
+    config.appEnv = 'production';
+    config.trialMode = false;
+    config.admin.bootstrapPassword = '1234';
+    config.admin.bootstrapPasswordConfigured = true;
+    ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
+    const productionWeak = await runTrialCheck({ reportPath: `tmp/rc9-production-weak-${Date.now()}.json` });
+    expect(productionWeak.ok).toBe(false);
+    expect(productionWeak.checks.find((check) => check.name === 'default_admin_password_warning').status).toBe('FAIL');
+    expect(productionWeak.summary.go_no_go.production_release).toBe('No-Go');
+
+    const strongPassword = 'Str0ngAdminPass!987';
+    config.admin.bootstrapPassword = strongPassword;
+    config.admin.bootstrapPasswordConfigured = true;
+    ensureAdmin('admin', await bcrypt.hash(strongPassword, 10), 'Admin');
+    const productionStrong = await runTrialCheck({ reportPath: `tmp/rc9-production-strong-${Date.now()}.json` });
+    const strongCheck = productionStrong.checks.find((check) => check.name === 'admin_password_check');
+    expect(strongCheck.status).toBe('PASS');
+    expect(productionStrong.summary.go_no_go.production_release).toBe('No-Go');
+    expect(productionStrong.summary.go_no_go.blockers).toContain('R2/S3 live storage is not accepted');
+    expect(JSON.stringify(productionStrong)).not.toContain(strongPassword);
+    expect(fs.readFileSync(path.resolve(config.rootDir, productionStrong.report_path), 'utf8')).not.toContain(strongPassword);
+
+    config.nodeEnv = previous.nodeEnv;
+    config.appEnv = previous.appEnv;
+    config.trialMode = previous.trialMode;
+    config.admin.bootstrapUsername = previous.bootstrapUsername;
+    config.admin.bootstrapPassword = previous.bootstrapPassword;
+    config.admin.bootstrapPasswordConfigured = previous.bootstrapPasswordConfigured;
+    config.admin.allowDefaultPassword = previous.allowDefaultPassword;
+    config.admin.requireSecurePassword = previous.requireSecurePassword;
+  });
+
+  it('RC9 HTTPS redirect and proxy trust gates are opt-in and method-aware', async () => {
+    const previous = {
+      forceHttps: config.forceHttps,
+      trustProxy: config.trustProxy,
+      httpsRedirectStatus: config.httpsRedirectStatus,
+    };
+    config.forceHttps = false;
+    expect((await request(app).get('/health')).status).toBe(200);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ad-studio-https-test-'));
+    config.forceHttps = true;
+    config.trustProxy = true;
+    config.httpsRedirectStatus = 308;
+    const httpsApp = await createApp({ dbPath: path.join(dir, 'database.sqlite') });
+
+    const forwarded = await request(httpsApp).get('/health').set('x-forwarded-proto', 'https');
+    expect(forwarded.status).toBe(200);
+    const redirect = await request(httpsApp).get('/health').set('host', 'imageai.test');
+    expect(redirect.status).toBe(308);
+    expect(redirect.headers.location).toBe('https://imageai.test/health');
+    const post = await request(httpsApp).post('/api/auth/login').send({ email: 'admin', password: '1234' });
+    expect(post.status).toBe(400);
+    expect(post.body).toEqual({ ok: false, error: 'https_required' });
+
+    config.forceHttps = previous.forceHttps;
+    config.trustProxy = previous.trustProxy;
+    config.httpsRedirectStatus = previous.httpsRedirectStatus;
   });
 });

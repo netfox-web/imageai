@@ -47,6 +47,8 @@ Seed admin:
 - `npm run devpilot:local`: run local DevPilot external API/client integration against a running server.
 - `npm run rc:local`: run safe RC2-prep diagnostics and write `tmp/rc-local-report.json`.
 - `npm run ai:ping`: live text ping for `fake`, `openai`, `gemini`, or `claude`.
+- `npm run domain:check`: verify public domain health, HTTPS, admin page reachability, and optional admin login.
+- `npm run domain:manual-guide`: print the manual NAS DNS / reverse proxy / certificate checklist.
 
 ## Environment
 
@@ -380,6 +382,119 @@ $env:SMOKE_EXPECT_STORAGE_DISK="local"
 $env:SMOKE_REPORT_PATH="./tmp/rc15-fake-local-smoke.json"
 npm run smoke:staging
 ```
+
+## imageai.tw Domain Fix
+
+Use [NAS_DOMAIN_FIX.md](./NAS_DOMAIN_FIX.md) for the non-engineer NAS runbook.
+
+Short checklist:
+
+- DNS A `@ -> 211.75.219.184`
+- Cloudflare Proxy status: DNS only / gray cloud first
+- Reverse proxy: `imageai.tw` HTTPS `443` -> HTTP `127.0.0.1:3050`
+- Certificate: Let's Encrypt for `imageai.tw` plus SAN `www.imageai.tw`
+- Verify with `npm run domain:check`
+
+## RC4 Public Trial Checklist
+
+RC4 adds public-domain diagnostics and admin trial tools while keeping the fake provider available.
+
+PowerShell local sanity:
+
+```powershell
+$env:NODE_ENV="development"
+$env:AI_PROVIDER="fake"
+$env:FILESYSTEM_DISK="local"
+$env:QUEUE_DRIVER="local"
+npm test
+npm run build
+npm run env:check
+npm run storage:check
+npm run rc:local
+```
+
+Domain / NAS diagnostics:
+
+```powershell
+$env:DOMAIN_CHECK_BASE_URL="https://imageai.tw"
+$env:DOMAIN_CHECK_ADMIN_USER="admin"
+$env:DOMAIN_CHECK_ADMIN_PASSWORD="<admin-password>"
+$env:DOMAIN_CHECK_REPORT_PATH="./tmp/domain-check.json"
+npm run domain:check
+```
+
+The domain report checks `/health`, `/health/deep`, `/`, `/admin`, optional admin login, HTTPS, cookie hints, CORS hints, APP_URL/PUBLIC_URL, and worker/storage/provider summaries. Reports redact admin password, cookies, tokens, API keys, secrets, and long base64-like strings.
+
+### imageai.tw DNS / HTTPS Troubleshooting
+
+For the full step-by-step NAS runbook, open [NAS_DOMAIN_FIX.md](./NAS_DOMAIN_FIX.md). Start with DNS only / gray cloud in Cloudflare; do not orange-cloud the record until Synology certificate and reverse proxy checks pass.
+
+PowerShell DNS checks:
+
+```powershell
+nslookup imageai.tw
+nslookup www.imageai.tw
+```
+
+PowerShell TCP checks:
+
+```powershell
+Test-NetConnection imageai.tw -Port 80
+Test-NetConnection imageai.tw -Port 443
+Test-NetConnection 211.75.219.184 -Port 3050
+```
+
+Header checks:
+
+```powershell
+curl.exe -I http://imageai.tw
+curl.exe -I https://imageai.tw
+curl.exe -I http://211.75.219.184:3050/health
+```
+
+NAS reverse proxy checklist:
+
+- Source protocol: HTTPS
+- Source hostname: `imageai.tw`
+- Source port: `443`
+- Destination protocol: HTTP
+- Destination hostname: `127.0.0.1`
+- Destination port: `3050`
+- Certificate: Let's Encrypt issued for `imageai.tw`; optionally include `www.imageai.tw`
+- Certificate auto renew: enabled
+- Router: forward TCP `80` to NAS
+- Router: forward TCP `443` to NAS
+- Port `3050` can remain internal only after reverse proxy works
+- Check whether ISP blocks inbound `80/443`
+- Check NAS Web Station / reverse proxy conflicts
+
+### Queue Driver Guidance
+
+- `QUEUE_DRIVER=local`: recommended for the current public trial / single-process NAS demo.
+- `QUEUE_DRIVER=worker`: use only after moving task state to a server-grade shared DB such as Postgres or MySQL.
+- SQLite / sql.js local DB is not reliable with separate app and worker processes because each process can hold a separate in-memory view of the DB file.
+- `npm run env:check` fails production `QUEUE_DRIVER=worker + DATABASE_CLIENT=sqlite/sqljs` and warns for production `QUEUE_DRIVER=local`.
+- In Docker Compose, the worker service is behind the `worker` profile. Start it only with `docker compose --profile worker up -d` after DB readiness is solved.
+
+New admin URLs:
+
+- `/admin/system` - runtime summary, security warnings, and admin password change.
+- `/admin/providers` - provider registry and last ping result.
+- `/admin/provider-playground` - safe text capability playground for configured providers.
+- `/admin/devpilot` - DevPilot external handoff dashboard.
+- `/admin/devpilot-keys` - source-scoped External API keys, stored hash-only.
+- `/admin/integration-toolbox` - downloadable integration resources.
+- `/admin/assets`, `/admin/quality`, `/admin/audit`, `/admin/usage` - asset, review, audit, and usage operations.
+
+Before public users:
+
+- Change the default `admin / 1234` password from `/admin/system`.
+- Use HTTPS and set `APP_URL` / `PUBLIC_URL` to the public domain.
+- Keep `AUTH_BYPASS=false` on public deployments.
+- Avoid wildcard CORS for authenticated production traffic.
+- Keep provider keys in env/secret manager; do not use DevPilot External API keys as AI provider keys.
+- SQLite remains acceptable for demo/staging only; plan Postgres/MySQL before production traffic.
+- DevPilot Gateway execution is still a scaffold until a formal execution contract exists.
 
 Manual browser URLs:
 
@@ -872,11 +987,180 @@ REGISTRATION_ENABLED=true
 FREE_CREDITS_ON_SIGNUP=100
 FAKE_TASK_COST=0
 OPENAI_TASK_ESTIMATED_COST_CREDITS=10
+GEMINI_TASK_ESTIMATED_COST_CREDITS=8
+CLAUDE_TASK_ESTIMATED_COST_CREDITS=8
 MIN_CREDITS_TO_CREATE_TASK=1
 REFUND_ON_TASK_FAILED=true
 ```
 
 Fake provider tasks cost `0` credits by default but still require a positive minimum balance to keep staging demos controlled. This is a demo ledger, not a production billing system.
+
+## RC5 Trial Acceptance
+
+Use this pass before giving the public trial to customers:
+
+- Login and change the default admin password.
+- Create a task with the fake provider.
+- View task outputs and task metadata.
+- Download an asset.
+- Favorite/archive an asset.
+- Create and open an asset share link.
+- Review quality status.
+- Adjust demo credits with a reason.
+- Run Provider Playground with `fake`.
+- Run a DevPilot handoff UI test.
+- Check audit and usage pages for redacted records.
+- Run `npm run rc:local`.
+- Run `npm run domain:check` only when explicitly validating the domain.
+- Run public fake smoke when the HTTPS domain is expected to be available.
+
+Trial diagnostic:
+
+```powershell
+npm run trial:check
+```
+
+The command writes `tmp/trial-check.json` with health, admin-system-safe, provider registry, storage, queue mode, default admin password warning, and secret-redaction checks.
+
+## RC6 Live Services + Production Readiness
+
+Admin password hardening:
+
+- Trial/dev may temporarily keep `admin / 1234`, but diagnostics must classify it as Testing only / WARN.
+- Production must set a strong `ADMIN_BOOTSTRAP_PASSWORD`; empty, `1234`, `admin`, `password`, `test`, `demo`, and `changeme` are treated as weak.
+- `/admin/system` and `npm run trial:check` never show the raw admin password.
+- Production release remains No-Go while the admin bootstrap password is missing or weak.
+
+Live provider pings do not create tasks and do not call image generation:
+
+```powershell
+$env:AI_PING_PROVIDER="openai"
+$env:OPENAI_API_KEY="<key>"
+$env:AI_PING_MODEL="gpt-4.1-mini"
+npm run ai:ping
+
+$env:AI_PING_PROVIDER="gemini"
+$env:GEMINI_API_KEY="<key>"
+$env:AI_PING_MODEL="gemini-1.5-flash"
+npm run ai:ping
+
+$env:AI_PING_PROVIDER="claude"
+$env:ANTHROPIC_API_KEY="<key>"
+$env:AI_PING_MODEL="claude-3-5-haiku-latest"
+npm run ai:ping
+```
+
+If a provider key is missing, `ai:ping` records `missing_api_key` and exits as a safe skip. Reports are written to `tmp/ai-ping-last.json` and are redacted. `/admin/providers` displays the last ping summary.
+
+R2 live storage check:
+
+```powershell
+$env:FILESYSTEM_DISK="r2"
+$env:R2_ACCOUNT_ID="<account-id>"
+$env:R2_BUCKET="<bucket>"
+$env:R2_ACCESS_KEY_ID="<access-key-id>"
+$env:R2_SECRET_ACCESS_KEY="<secret>"
+$env:STORAGE_PUBLIC_URL="https://assets.example.com"
+npm run storage:check
+```
+
+S3 live storage check uses `FILESYSTEM_DISK=s3`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `STORAGE_PUBLIC_URL`. The check writes, reads, verifies existence, deletes cleanup objects, and validates public URL GET when a public URL is configured.
+
+Production DB and queue plan:
+
+- Public trial: `QUEUE_DRIVER=local` with SQLite/sql.js is acceptable for a small single-process trial.
+- Production: use `DATABASE_CLIENT=postgres` or `DATABASE_CLIENT=mysql`, `QUEUE_DRIVER=worker`, and shared server-grade DB state for app plus worker.
+- Migration plan: export/backup current SQLite data, prepare schema mapping for users/tasks/images/credits/audit/handoffs/assets, run a dry migration into staging DB, verify smoke and `trial:check`, keep the SQLite backup for rollback, then switch app and worker together.
+
+Public Trial Go/No-Go:
+
+- Public trial: Conditional Go is allowed while `admin / 1234` is intentionally kept for internal testing only.
+- Production release: No-Go while `admin / 1234` is active. Change it before external/public release.
+- Go: `https://imageai.tw/health` returns 200, public smoke passed, `trial:check` has no critical fail, `env:check` passes, `storage:check` passes, fake fallback works, reports are redacted, rate limits and upload limits are enabled.
+- No-Go: `AUTH_BYPASS=true`, exposed API key, production stack trace, domain health failure, storage public URL failure, default admin password in production release, or worker plus SQLite production mode.
+
+## RC8 Trial Operations
+
+Trial mode:
+
+```env
+TRIAL_MODE=true
+TRIAL_MODE_MESSAGE="目前為測試站，資料與圖片可能會被清理。"
+INVITE_CODE_ENABLED=true
+TRIAL_INVITE_CODE=
+INVITE_CODE_LABEL="Trial invite code"
+```
+
+During internal testing, `admin / 1234` may remain temporarily active only when it is clearly marked as Testing only. Change it before external/public release or production launch. The invite code is never returned by bootstrap, admin status, trial reports, or feedback responses.
+
+Trial user flow:
+
+1. Open `https://imageai.tw`
+2. Login or register with invite code
+3. Create task
+4. Upload product image
+5. Analyze product
+6. Generate banner
+7. Download output
+8. Save or favorite asset
+9. Share asset
+10. Submit feedback
+
+Trial admin flow:
+
+1. Check `/admin/system`
+2. Check `/admin/trial`
+3. Check `/admin/feedback`
+4. Check `/admin/tasks`
+5. Check `/admin/assets`
+6. Check `/admin/usage`
+7. Check `/admin/audit`
+8. Run `npm run trial:check`
+9. Run `npm run trial:cleanup`
+
+Trial cleanup is dry run by default:
+
+```powershell
+$env:TRIAL_CLEANUP_DRY_RUN="true"
+$env:TRIAL_CLEANUP_OLDER_THAN_DAYS="7"
+$env:TRIAL_CLEANUP_INCLUDE_OUTPUTS="false"
+npm run trial:cleanup
+```
+
+Known trial limitations: `admin / 1234` may remain during internal testing only, `QUEUE_DRIVER=local`, local storage, no R2 live yet, no Gemini/Claude live yet, DevPilot Gateway execution is not implemented, HTTP redirect is not fixed yet, and SQLite/sql.js is not production-grade.
+
+Trial Go: HTTPS works, smoke passes, invite gate enabled or admin-approved users only, feedback works, trial warning is visible, and reports are redacted.
+
+Production No-Go: default admin password active, no server-grade DB, no R2/S3, no provider live validation except OpenAI, or no production monitoring.
+
+## RC9 Production Hardening
+
+Secure admin bootstrap:
+
+```env
+ADMIN_BOOTSTRAP_USERNAME=admin
+ADMIN_BOOTSTRAP_PASSWORD=
+ALLOW_DEFAULT_ADMIN_PASSWORD=false
+REQUIRE_SECURE_ADMIN_PASSWORD=true
+```
+
+Trial/dev can temporarily use `admin / 1234` only as a clearly marked Trial Only account. Production must configure a strong `ADMIN_BOOTSTRAP_PASSWORD`; weak values include empty, `1234`, `admin`, `password`, `test`, `demo`, and `changeme`. Diagnostics and reports only show configured/weak/redacted status and never print the raw password.
+
+HTTPS redirect and proxy trust:
+
+```env
+TRUST_PROXY=true
+FORCE_HTTPS=true
+HTTPS_REDIRECT_STATUS=308
+```
+
+When the app runs behind Synology, Nginx, Cloudflare, or another reverse proxy, enable `TRUST_PROXY=true` so Express can honor forwarded HTTPS state. `FORCE_HTTPS=true` redirects HTTP `GET` and `HEAD` requests to `https://host + originalUrl`; non-idempotent HTTP requests return `{ "ok": false, "error": "https_required" }` instead of redirecting.
+
+Production gates:
+
+- Public trial remains Conditional Go while `admin / 1234` is intentionally kept for testing.
+- Production release remains No-Go until admin password, R2/S3, Gemini/Claude, server-grade DB/queue, DevPilot Gateway execution contract, and HTTP redirect/proxy behavior are all accepted.
+- Reports do not output raw secrets, admin passwords, API keys, or full base64 payloads.
 
 ### Rate limit and upload guardrails
 
@@ -897,13 +1181,19 @@ SQLite is still the local/demo/staging default. Production should move to Postgr
 PM2 remains the preferred deployment path for this RC, but a Docker skeleton is available:
 
 ```powershell
+$env:HOST_PORT="3050"
 docker build -t ad-studio-ai .
 docker compose up --build
 docker compose logs -f
 docker compose down
 ```
 
-The compose file starts `app` and `worker`, mounts local storage, reads `.env`, and health-checks `/health`.
+The compose file starts `app` and `worker`, mounts local storage, reads `.env`, maps `${HOST_PORT:-3000}:3000`, and health-checks `/health`.
+For public trial with SQLite/sql.js, use the default app-only compose profile and keep `QUEUE_DRIVER=local`. Enable the worker profile only after moving to Postgres/MySQL:
+
+```powershell
+docker compose --profile worker up --build -d
+```
 
 ## Windows Troubleshooting
 

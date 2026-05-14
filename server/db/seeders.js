@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { get, insert, now, run } from './database.js';
+import { config } from '../config/index.js';
 
 function upsert(table, uniqueColumns, values) {
   const timestamp = now();
@@ -232,7 +233,7 @@ function seedPromptTemplates() {
 }
 
 async function seedDemoAdmin() {
-  ensureAdmin('admin', await bcrypt.hash('1234', 10), 'Admin');
+  ensureAdmin(config.admin.bootstrapUsername, await bcrypt.hash(config.admin.bootstrapPassword, 10), 'Admin');
 }
 
 export function ensureAdmin(email, passwordHash, name = 'Admin') {

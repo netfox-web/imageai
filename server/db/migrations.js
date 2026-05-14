@@ -38,6 +38,7 @@ export async function migrate() {
     addColumnIfMissing('users', 'role', "TEXT NOT NULL DEFAULT 'user'");
     addColumnIfMissing('users', 'credits_balance', 'INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('users', 'status', "TEXT NOT NULL DEFAULT 'active'");
+    addColumnIfMissing('users', 'last_login_at', 'TEXT NULL');
     addColumnIfMissing('users', 'created_at', 'TEXT NULL');
     addColumnIfMissing('users', 'updated_at', 'TEXT NULL');
   }
@@ -320,6 +321,24 @@ export async function migrate() {
   }
 
   run(`
+    CREATE TABLE IF NOT EXISTS task_regeneration_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      task_image_id INTEGER NULL,
+      user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'requested' CHECK (status IN ('requested', 'reviewed', 'queued', 'canceled')),
+      reason TEXT NULL,
+      output_url TEXT NULL,
+      metadata_json TEXT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES generation_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_image_id) REFERENCES task_images(id) ON DELETE SET NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  run(`
     CREATE TABLE IF NOT EXISTS ai_handoff_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       conversation_ref TEXT NOT NULL,
@@ -383,6 +402,48 @@ export async function migrate() {
   `);
 
   run(`
+    CREATE TABLE IF NOT EXISTS asset_share_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_image_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      token TEXT NOT NULL UNIQUE,
+      revoked_at TEXT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (task_image_id) REFERENCES task_images(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  run(`
+    CREATE TABLE IF NOT EXISTS feedback_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NULL,
+      task_id INTEGER NULL,
+      asset_url TEXT NULL,
+      type TEXT NOT NULL DEFAULT 'other' CHECK (type IN ('bug', 'quality', 'billing', 'account', 'other')),
+      severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN ('low', 'medium', 'high')),
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      browser_info_safe TEXT NULL,
+      screenshot_url TEXT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'reviewing', 'resolved', 'ignored')),
+      admin_notes TEXT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (task_id) REFERENCES generation_tasks(id) ON DELETE SET NULL
+    )
+  `);
+
+  if (hasTable('prompt_templates')) {
+    addColumnIfMissing('prompt_templates', 'capability', 'TEXT NULL');
+    addColumnIfMissing('prompt_templates', 'template_body', 'TEXT NULL');
+    addColumnIfMissing('prompt_templates', 'variables_json', 'TEXT NULL');
+    addColumnIfMissing('prompt_templates', 'created_by_user_id', 'INTEGER NULL');
+  }
+
+  run(`
     CREATE TABLE IF NOT EXISTS audit_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       actor_type TEXT NOT NULL,
@@ -406,6 +467,10 @@ export async function migrate() {
   run('CREATE INDEX IF NOT EXISTS idx_ai_handoff_logs_status_risk ON ai_handoff_logs(status, risk)');
   run('CREATE INDEX IF NOT EXISTS idx_devpilot_external_api_keys_source_status ON devpilot_external_api_keys(source_system, status)');
   run('CREATE INDEX IF NOT EXISTS idx_asset_metadata_user_archived ON asset_metadata(user_id, archived)');
+  run('CREATE INDEX IF NOT EXISTS idx_asset_share_tokens_token ON asset_share_tokens(token)');
+  run('CREATE INDEX IF NOT EXISTS idx_feedback_reports_status_created ON feedback_reports(status, created_at)');
+  run('CREATE INDEX IF NOT EXISTS idx_feedback_reports_task ON feedback_reports(task_id)');
+  run('CREATE INDEX IF NOT EXISTS idx_task_regeneration_requests_task ON task_regeneration_requests(task_id)');
   run('CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created ON audit_logs(action, created_at)');
   run('CREATE INDEX IF NOT EXISTS idx_audit_logs_target ON audit_logs(target_type, target_id)');
 }

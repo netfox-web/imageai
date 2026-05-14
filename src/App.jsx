@@ -113,6 +113,7 @@ export function App() {
   return (
     <div className="min-h-screen overflow-x-hidden bg-paper">
       <Navbar {...commonProps} />
+      <TrialBanner bootstrap={bootstrap} />
       {!bootstrap ? (
         <div className="flex min-h-[60vh] items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin" />
@@ -123,6 +124,7 @@ export function App() {
       {authModal && (
         <AuthModal
           initialTab={authModal}
+          bootstrap={bootstrap}
           onClose={() => setAuthModal(null)}
           onAuthed={async () => {
             await refreshSession();
@@ -137,6 +139,8 @@ export function App() {
 function Router(props) {
   const { route, user, openAuth } = props;
   if (route === '/') return <HomePage {...props} />;
+  if (route.startsWith('/share/') && route.split('/')[2]) return <SharePage token={route.split('/')[2]} />;
+  if (route === '/feedback') return <FeedbackPage {...props} />;
   if (route.startsWith('/admin')) return <AdminRouter {...props} />;
   if (route === '/pricing') return <PricingPage {...props} />;
   if (route.startsWith('/tasks/') && route.split('/')[2]) return <TaskDetailPage {...props} taskId={route.split('/')[2]} />;
@@ -210,9 +214,18 @@ function Navbar({ user, navigate, openAuth, refreshSession }) {
   );
 }
 
-function AuthModal({ initialTab, onClose, onAuthed }) {
+function TrialBanner({ bootstrap }) {
+  if (!bootstrap?.trialMode?.enabled) return null;
+  return (
+    <div className="border-b border-yellow-300 bg-yellow-100 px-4 py-2 text-center text-sm font-black text-neutral-950">
+      Testing only: {bootstrap.trialMode.message || '目前為測試站，資料與圖片可能會被清理。'}
+    </div>
+  );
+}
+
+function AuthModal({ initialTab, bootstrap, onClose, onAuthed }) {
   const [tab, setTab] = useState(initialTab);
-  const [form, setForm] = useState({ name: '', email: '', password: '', terms: true });
+  const [form, setForm] = useState({ name: '', email: '', password: '', invite_code: '', terms: true });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -271,6 +284,12 @@ function AuthModal({ initialTab, onClose, onAuthed }) {
             <label className="label">密碼</label>
             <input className="field" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
           </div>
+          {tab === 'register' && bootstrap?.registration?.invite_code_enabled && (
+            <div>
+              <label className="label">{bootstrap.registration.invite_code_label || 'Trial invite code'}</label>
+              <input className="field" value={form.invite_code} onChange={(e) => setForm({ ...form, invite_code: e.target.value })} />
+            </div>
+          )}
           {tab === 'register' && (
             <label className="flex items-start gap-2 text-sm text-neutral-600">
               <input type="checkbox" className="mt-1" checked={form.terms} onChange={(e) => setForm({ ...form, terms: e.target.checked })} />
@@ -320,6 +339,8 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
   const [styleModal, setStyleModal] = useState(false);
   const [favorites, setFavorites] = useState(() => JSON.parse(localStorage.getItem('ad-studio-style-favorites') || '[]'));
   const [loadingAnalyze, setLoadingAnalyze] = useState(false);
+  const [fileError, setFileError] = useState('');
+  const [analysisMeta, setAnalysisMeta] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingSubmit, setPendingSubmit] = useState(false);
   const [message, setMessage] = useState('');
@@ -383,12 +404,20 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
 
   const addFiles = (incoming) => {
     const next = [...files];
+    let rejected = '';
     Array.from(incoming).forEach((file) => {
       if (next.length >= 10) return;
-      if (!['image/jpeg', 'image/png', 'image/webp', 'image/bmp'].includes(file.type)) return;
-      if (file.size > 10 * 1024 * 1024) return;
+      if (!['image/jpeg', 'image/png', 'image/webp', 'image/bmp'].includes(file.type)) {
+        rejected = 'Only png, jpg, jpeg, webp, and bmp images are supported.';
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        rejected = 'File is too large. Maximum size is 10MB.';
+        return;
+      }
       next.push({ file, preview: URL.createObjectURL(file), role: next.length === 0 ? 'cover' : 'multi_use' });
     });
+    setFileError(rejected);
     setFiles(next);
   };
 
@@ -413,10 +442,12 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
         custom_prompt: result.customPrompt,
       });
       setFiles((items) => items.map((item, index) => ({ ...item, role: result.imageRoles[index] || item.role })));
+      setAnalysisMeta(result._meta || null);
       setNotice(`AI 分析完成${result._meta?.provider ? ` (${result._meta.provider})` : ''}`);
     } catch (err) {
       setMessage(err.message);
       setNotice('');
+      setAnalysisMeta(null);
     } finally {
       setLoadingAnalyze(false);
     }
@@ -470,6 +501,8 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
     setForm({ product_name: '', main_title: '', subtitle: '', custom_prompt: '' });
     setNotice('');
     setMessage('');
+    setFileError('');
+    setAnalysisMeta(null);
     setSelectedFormatIds([]);
     setCustomFormats([]);
     localStorage.removeItem('ad-studio-draft');
@@ -487,11 +520,28 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
         <div className="min-w-0">
           <p className="text-xs font-black tracking-[0.28em] text-yellow-600">AI-POWERED DESIGN TOOL</p>
           <h1 className="mt-3 max-w-3xl text-4xl font-black leading-tight text-neutral-950 sm:text-5xl">
-            把照片丟進來，廣告素材就出來
+            AI commerce ad generator for product images and banners
           </h1>
           <p className="mt-4 max-w-2xl text-base leading-7 text-neutral-600">
-            蝦皮、IG、FB、Dcard、Yahoo 投廣 / 活動 / 產品圖，一鍵全搞定。
+            Upload product images, analyze copy, create multi-platform campaign assets, and manage outputs from one workflow.
           </p>
+          <div className="mt-5 grid gap-3 sm:grid-cols-2">
+            {[
+              ['Product Analysis', 'AI-assisted product copy and image role suggestions.'],
+              ['Multi-format Banners', 'Generate 1:1, 4:5, 9:16, 16:9, and 1200x628 assets.'],
+              ['Asset Library', 'Search, download, tag, favorite, and export generated assets.'],
+              ['DevPilot Handoff', 'Use source-scoped external keys and toolbox resources safely.'],
+            ].map(([title, text]) => (
+              <div key={title} className="rounded-lg border border-neutral-200 bg-white p-3">
+                <div className="font-black text-neutral-950">{title}</div>
+                <div className="mt-1 text-sm leading-6 text-neutral-500">{text}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-5 flex flex-wrap gap-3">
+            <button className="btn btn-yellow" onClick={() => (user ? navigate('/dashboard') : openAuth('login'))}>{user ? 'Open Dashboard' : 'Login to Start'}</button>
+            <button className="btn btn-ghost" onClick={() => navigate('/assets')}>Open Assets</button>
+          </div>
         </div>
         <div className="panel">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -516,11 +566,11 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
 
       <section className="mt-6 grid min-w-0 gap-6 lg:grid-cols-[1fr_380px]">
         <div className="min-w-0 space-y-6">
-          <UploadPanel files={files} setFiles={setFiles} addFiles={addFiles} banner={toolType === 'banner'} />
+          <UploadPanel files={files} setFiles={setFiles} addFiles={addFiles} banner={toolType === 'banner'} fileError={fileError} />
 
           {toolType === 'banner' ? (
             <>
-              <CopyForm form={form} setForm={setForm} analyze={analyze} loadingAnalyze={loadingAnalyze} clearAll={clearAll} />
+              <CopyForm form={form} setForm={setForm} analyze={analyze} loadingAnalyze={loadingAnalyze} clearAll={clearAll} analysisMeta={analysisMeta} />
               <StylePicker
                 styles={stylePresets}
                 styleKey={styleKey}
@@ -672,7 +722,7 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
   );
 }
 
-function UploadPanel({ files, setFiles, addFiles, banner }) {
+function UploadPanel({ files, setFiles, addFiles, banner, fileError = '' }) {
   return (
     <section className="panel">
       <div className="mb-3 flex items-center justify-between">
@@ -694,6 +744,8 @@ function UploadPanel({ files, setFiles, addFiles, banner }) {
         <span className="mt-2 text-sm font-bold">點擊上傳或拖曳上傳</span>
         <input className="hidden" type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp" onChange={(e) => addFiles(e.target.files)} />
       </label>
+      <div className="mt-2 text-xs text-neutral-500">Accepted: png, jpg, webp. Maximum: 10MB. Suggested: square product image, 1024px or larger.</div>
+      {fileError && <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm font-bold text-red-700">{fileError}</div>}
       {!!files.length && (
         <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
           {files.map((item, index) => (
@@ -728,7 +780,7 @@ function UploadPanel({ files, setFiles, addFiles, banner }) {
   );
 }
 
-function CopyForm({ form, setForm, analyze, loadingAnalyze, clearAll }) {
+function CopyForm({ form, setForm, analyze, loadingAnalyze, clearAll, analysisMeta = null }) {
   return (
     <section className="panel">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -743,6 +795,13 @@ function CopyForm({ form, setForm, analyze, loadingAnalyze, clearAll }) {
           </button>
         </div>
       </div>
+      {analysisMeta && (
+        <div className="mb-3 flex flex-wrap gap-2 text-xs">
+          <span className="rounded-full bg-neutral-950 px-3 py-1 font-black text-white">provider: {analysisMeta.provider || '-'}</span>
+          <span className="rounded-full bg-neutral-100 px-3 py-1 font-bold text-neutral-700">model: {analysisMeta.model || '-'}</span>
+          <span className="rounded-full bg-yellow-100 px-3 py-1 font-bold text-yellow-800">fallback: {analysisMeta.fallback_used ? 'yes' : 'no'}</span>
+        </div>
+      )}
       <div className="grid gap-3 md:grid-cols-2">
         <Field label="產品名稱，不顯示在圖上" value={form.product_name} onChange={(value) => setForm({ ...form, product_name: value })} />
         <Field label="主標語，顯示在圖上" value={form.main_title} onChange={(value) => setForm({ ...form, main_title: value })} />
@@ -1210,6 +1269,23 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
 
   const latestCostLog = task.ai_cost_logs?.[0] || null;
   const latestCostMeta = parseTaskCostMeta(latestCostLog);
+  const taskAction = async (path, body = {}) => {
+    const result = await api(path, { method: 'POST', body });
+    await load();
+    return result;
+  };
+  const retryTask = () => taskAction(`/api/tasks/${task.id}/retry`);
+  const duplicateTask = async () => {
+    const result = await taskAction(`/api/tasks/${task.id}/duplicate`);
+    if (result.redirect_url) navigate(result.redirect_url);
+  };
+  const requestQuality = () => taskAction(`/api/tasks/${task.id}/quality-review-request`, { reason: 'Requested from task detail.' });
+  const requestHandoff = () => taskAction(`/api/tasks/${task.id}/devpilot-handoff`, { reason: 'Task detail handoff requested.' });
+  const regenerateOutput = (image) => taskAction(`/api/tasks/${task.id}/regenerations`, { task_image_id: image.id, reason: 'Selected output needs another version.' });
+  const updateAsset = async (image, patch) => {
+    await api(`/api/assets/${image.id}/metadata`, { method: 'POST', body: patch });
+    await load();
+  };
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-8">
@@ -1282,7 +1358,7 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
             <div className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">
               <div className="font-bold">錯誤原因</div>
               <div>{task.error_message || '未知錯誤'}</div>
-              <button className="btn btn-ghost mt-3 gap-2"><RefreshCcw className="h-4 w-4" />重試（預留）</button>
+              <button onClick={retryTask} className="btn btn-ghost mt-3 gap-2"><RefreshCcw className="h-4 w-4" />Retry failed task</button>
             </div>
           )}
         </aside>
@@ -1297,11 +1373,17 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
           {task.status === 'success' && (
             <>
               <div className="mb-4 flex flex-wrap gap-2">
-                <button className="btn btn-ghost gap-2"><Download className="h-4 w-4" />全部下載（預留）</button>
-                <button className="btn btn-ghost gap-2"><RefreshCcw className="h-4 w-4" />重新生成（預留）</button>
-                <button className="btn btn-ghost gap-2"><Copy className="h-4 w-4" />複製設定（預留）</button>
+                <button className="btn btn-ghost gap-2" onClick={duplicateTask}><Copy className="h-4 w-4" />Duplicate task</button>
+                <button className="btn btn-ghost gap-2" onClick={requestQuality}><CheckCircle2 className="h-4 w-4" />Request quality review</button>
+                <button className="btn btn-ghost gap-2" onClick={requestHandoff}><Shield className="h-4 w-4" />Request DevPilot handoff</button>
+                <button className="btn btn-ghost gap-2" onClick={() => navigate(`/feedback?task_id=${task.id}`)}><AlertTriangle className="h-4 w-4" />Report issue</button>
               </div>
-              <ImageGrid images={task.output_images} />
+              <ImageGrid
+                images={task.output_images}
+                onRegenerate={regenerateOutput}
+                onFavorite={(image) => updateAsset(image, { favorite: true })}
+                onArchive={(image) => updateAsset(image, { archived: true })}
+              />
             </>
           )}
           {task.status !== 'success' && <ImageGrid images={task.input_images} title="上傳原圖" />}
@@ -1311,7 +1393,7 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
   );
 }
 
-function ImageGrid({ images, title = '生成圖片' }) {
+function ImageGrid({ images, title = '生成圖片', onRegenerate = null, onFavorite = null, onArchive = null }) {
   return (
     <div className="panel">
       <h2 className="mb-3 text-lg font-black">{title}</h2>
@@ -1335,6 +1417,15 @@ function ImageGrid({ images, title = '生成圖片' }) {
                 <Download className="h-4 w-4" />
                 下載
               </a>
+              {(onRegenerate || onFavorite || onArchive) && (
+                <div className="mt-2 grid gap-2 text-xs">
+                  {onRegenerate && <button className="btn btn-ghost px-2 py-1" onClick={() => onRegenerate(image)}>Regenerate request</button>}
+                  {onFavorite && <button className="btn btn-ghost px-2 py-1" onClick={() => onFavorite(image)}>Mark favorite</button>}
+                  {onArchive && <button className="btn btn-ghost px-2 py-1" onClick={() => onArchive(image)}>Archive output</button>}
+                  <button className="btn btn-ghost px-2 py-1" onClick={() => navigator.clipboard?.writeText(image.url)}>Copy output URL</button>
+                  <button className="btn btn-ghost px-2 py-1" onClick={() => { window.location.href = `/feedback?asset_url=${encodeURIComponent(image.url)}`; }}>Report image issue</button>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -1385,6 +1476,22 @@ function AssetsPage(props) {
     anchor.download = 'asset-manifest.json';
     anchor.click();
     URL.revokeObjectURL(url);
+  };
+  const exportCsv = () => {
+    const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
+    window.location.href = `/api/assets.csv?ids=${ids.join(',')}`;
+  };
+  const batchAction = async (action) => {
+    const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
+    await api('/api/assets/batch', { method: 'POST', body: { ids, action, tags: action === 'tag' ? 'trial-selected' : undefined } });
+    setMessage(`Batch ${action} saved for ${ids.length} assets.`);
+    load();
+  };
+  const createShare = async (asset) => {
+    const result = await api(`/api/assets/${asset.id}/share`, { method: 'POST', body: {} });
+    await navigator.clipboard?.writeText(result.share.share_url);
+    setMessage(`Share link ready: ${result.share.share_url}`);
+    load();
   };
   return (
     <DashboardShell {...props}>
@@ -1448,6 +1555,22 @@ function AssetsManagerPage(props) {
     anchor.click();
     URL.revokeObjectURL(url);
   };
+  const exportCsv = () => {
+    const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
+    window.location.href = `/api/assets.csv?ids=${ids.join(',')}`;
+  };
+  const batchAction = async (action) => {
+    const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
+    await api('/api/assets/batch', { method: 'POST', body: { ids, action, tags: action === 'tag' ? 'trial-selected' : undefined } });
+    setMessage(`Batch ${action} saved for ${ids.length} assets.`);
+    load();
+  };
+  const createShare = async (asset) => {
+    const result = await api(`/api/assets/${asset.id}/share`, { method: 'POST', body: {} });
+    await navigator.clipboard?.writeText(result.share.share_url);
+    setMessage(`Share link ready: ${result.share.share_url}`);
+    load();
+  };
   return (
     <DashboardShell {...props}>
       <PageTitle title="Assets" subtitle="Generated outputs, metadata, download links, and manifest export." />
@@ -1462,7 +1585,7 @@ function AssetsManagerPage(props) {
           </button>
         ))}
       </div>
-      <div className="panel mb-4 grid gap-2 md:grid-cols-[1fr_150px_150px_auto_auto]">
+      <div className="panel mb-4 grid gap-2 md:grid-cols-[1fr_150px_150px_auto_auto_auto]">
         <input className="field" placeholder="Search product or task id" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()} />
         <select className="field" value={provider} onChange={(e) => setProvider(e.target.value)}>
           <option value="all">All providers</option>
@@ -1474,6 +1597,12 @@ function AssetsManagerPage(props) {
         <input className="field" placeholder="Format" value={format === 'all' ? '' : format} onChange={(e) => setFormat(e.target.value || 'all')} />
         <button className="btn btn-primary gap-2" onClick={load}><Search className="h-4 w-4" />Search</button>
         <button className="btn btn-ghost gap-2" onClick={exportManifest}><Download className="h-4 w-4" />Manifest</button>
+        <button className="btn btn-ghost gap-2" onClick={exportCsv}><Download className="h-4 w-4" />CSV</button>
+      </div>
+      <div className="mb-4 flex flex-wrap gap-2">
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('favorite')}>Batch favorite</button>
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('archive')}>Batch archive</button>
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('tag')}>Batch tag</button>
       </div>
       {message && <div className="mb-4 rounded-lg bg-green-50 p-3 text-sm font-bold text-green-700">{message}</div>}
       <div className="panel">
@@ -1507,6 +1636,8 @@ function AssetsManagerPage(props) {
                     <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.url)}><Copy className="h-3 w-3" />Copy URL</button>
                     <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { favorite: !asset.favorite })}><Heart className="h-3 w-3" />{asset.favorite ? 'Unfavorite' : 'Favorite'}</button>
                     <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { archived: true })}>Archive</button>
+                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => createShare(asset)}>Share link</button>
+                    {asset.share_url && <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.share_url)}>Copy share</button>}
                   </div>
                   <div className="mt-3 space-y-2">
                     <input className="field text-xs" placeholder="tags comma separated" value={draft.tags} onChange={(e) => setDrafts({ ...drafts, [asset.id]: { ...draft, tags: e.target.value } })} />
@@ -1536,6 +1667,21 @@ function CreditsPage(props) {
           <div className="panel flex items-center justify-between">
             <div><div className="text-sm text-neutral-500">目前餘額</div><div className="text-3xl font-black">{data.balance} 點</div></div>
             <button className="btn btn-yellow" onClick={() => props.navigate('/pricing')}>購買點數</button>
+          </div>
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="panel"><div className="text-xs text-neutral-500">Total spent</div><div className="mt-2 text-2xl font-black">{data.totalSpent || 0}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Today spent</div><div className="mt-2 text-2xl font-black">{data.todaySpent || 0}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Fake provider</div><div className="mt-2 text-2xl font-black">demo / {data.fakeProviderCost || 0}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Recharge</div><div className="mt-2 text-sm font-bold">Demo placeholder</div></div>
+          </div>
+          <div className="panel overflow-x-auto">
+            <h2 className="mb-3 font-black">Recent task costs</h2>
+            <table className="w-full min-w-[680px] text-left text-sm">
+              <thead className="text-xs text-neutral-500"><tr><th className="py-2">Task</th><th>Product</th><th>Status</th><th>Task cost</th><th>Provider</th><th>Provider cost</th><th>Refund</th></tr></thead>
+              <tbody>{(data.taskCosts || []).map((task) => (
+                <tr key={task.task_id} className="border-t border-neutral-100"><td className="py-3">#{task.task_id}</td><td>{task.product_name || '-'}</td><td>{task.status}</td><td>{task.credits_cost}</td><td>{task.provider || task.metadata?.provider || '-'}</td><td>{task.cost_usd ?? task.metadata?.cost ?? '-'}</td><td>{task.status === 'failed' ? 'policy checked' : '-'}</td></tr>
+              ))}</tbody>
+            </table>
           </div>
           <div className="panel overflow-x-auto">
             <table className="w-full min-w-[620px] text-left text-sm">
@@ -1626,11 +1772,17 @@ function AdminRouter(props) {
   const path = props.route;
   if (path.startsWith('/admin/tasks/')) return <AdminTaskDetailPage {...props} taskId={path.split('/')[3]} />;
   if (path === '/admin/users') return <AdminUsersPage {...props} />;
+  if (path === '/admin/credits') return <AdminCreditsPage {...props} />;
   if (path === '/admin/tasks') return <AdminTasksPage {...props} />;
   if (path === '/admin/storage') return <AdminStoragePage {...props} />;
   if (path === '/admin/quality') return <AdminQualityPage {...props} />;
   if (path === '/admin/system') return <AdminSystemPage {...props} />;
+  if (path === '/admin/trial') return <AdminTrialPage {...props} />;
+  if (path === '/admin/feedback') return <AdminFeedbackPage {...props} />;
   if (path === '/admin/providers') return <AdminProvidersPage {...props} />;
+  if (path === '/admin/provider-playground') return <AdminProviderPlaygroundPage {...props} />;
+  if (path === '/admin/devpilot') return <AdminDevPilotPage {...props} />;
+  if (path === '/admin/devpilot/handoffs') return <AdminDevPilotHandoffsPage {...props} />;
   if (path === '/admin/devpilot-keys') return <AdminDevPilotKeysPage {...props} />;
   if (path === '/admin/integration-toolbox') return <AdminIntegrationToolboxPage {...props} />;
   if (path === '/admin/assets') return <AdminAssetsPage {...props} />;
@@ -1647,11 +1799,17 @@ function AdminShell({ route, navigate, children }) {
   const links = [
     ['/admin', '總覽'],
     ['/admin/users', '使用者管理'],
+    ['/admin/credits', 'Credits'],
     ['/admin/tasks', '任務管理'],
     ['/admin/storage', 'Storage'],
     ['/admin/quality', 'Quality Review'],
     ['/admin/system', 'System'],
+    ['/admin/trial', 'Trial Ops'],
+    ['/admin/feedback', 'Feedback'],
     ['/admin/providers', 'AI Providers'],
+    ['/admin/provider-playground', 'Provider Playground'],
+    ['/admin/devpilot', 'DevPilot'],
+    ['/admin/devpilot/handoffs', 'Handoffs'],
     ['/admin/devpilot-keys', 'DevPilot Keys'],
     ['/admin/integration-toolbox', 'Integration Toolbox'],
     ['/admin/assets', 'Assets'],
@@ -1728,6 +1886,165 @@ function AdminUsersPage(props) {
         </table>
       </div>
     </AdminShell>
+  );
+}
+
+function AdminCreditsPage(props) {
+  const [data, setData] = useState(null);
+  const [q, setQ] = useState('');
+  const [form, setForm] = useState({ user_id: '', amount: 100, note: '' });
+  const [message, setMessage] = useState('');
+  const load = () => {
+    const query = new URLSearchParams();
+    if (q) query.set('q', q);
+    api(`/api/admin/credits?${query}`).then(setData);
+  };
+  useEffect(load, []);
+  const adjust = async () => {
+    await api(`/api/admin/users/${form.user_id}/adjust-credits`, { method: 'POST', body: { amount: Number(form.amount), note: form.note } });
+    setMessage('Credit adjustment saved.');
+    load();
+  };
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="Admin Credits" subtitle="Demo credit ledger, manual adjustment, and redacted CSV export." />
+      <div className="space-y-4">
+        {message && <div className="rounded-lg bg-green-50 p-3 text-sm font-bold text-green-700">{message}</div>}
+        <div className="panel grid gap-2 md:grid-cols-[1fr_auto]">
+          <input className="field" placeholder="Search user email/name/id" value={q} onChange={(event) => setQ(event.target.value)} />
+          <button className="btn btn-primary" onClick={load}>Search</button>
+        </div>
+        <div className="panel grid gap-2 md:grid-cols-[120px_120px_1fr_auto]">
+          <input className="field" placeholder="User ID" value={form.user_id} onChange={(event) => setForm({ ...form, user_id: event.target.value })} />
+          <input className="field" type="number" value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} />
+          <input className="field" placeholder="Reason required" value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} />
+          <button className="btn btn-yellow" onClick={adjust}>Adjust</button>
+        </div>
+        {!data ? <LoadingPanel /> : (
+          <>
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="panel"><div className="text-xs text-neutral-500">Total balance</div><div className="mt-2 text-2xl font-black">{data.totalBalance}</div></div>
+              <div className="panel"><div className="text-xs text-neutral-500">Total spent</div><div className="mt-2 text-2xl font-black">{data.totalSpent}</div></div>
+              <a className="panel text-sm font-black" href="/api/admin/credits.csv">Export ledger CSV</a>
+            </div>
+            <div className="panel overflow-x-auto">
+              <table className="w-full min-w-[880px] text-left text-sm">
+                <thead className="text-xs text-neutral-500"><tr><th className="py-2">ID</th><th>User</th><th>Type</th><th>Amount</th><th>Balance</th><th>Task</th><th>Reason</th><th>Created</th></tr></thead>
+                <tbody>{data.ledger?.map((tx) => (
+                  <tr key={tx.id} className="border-t border-neutral-100"><td className="py-3">#{tx.id}</td><td>{tx.email} #{tx.user_id}</td><td>{tx.type}</td><td>{tx.amount}</td><td>{tx.balance_after}</td><td>{tx.related_task_id || '-'}</td><td>{tx.note || '-'}</td><td>{new Date(tx.created_at).toLocaleString()}</td></tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </AdminShell>
+  );
+}
+
+function AdminTrialPage(props) {
+  const [data, setData] = useState(null);
+  useEffect(() => { api('/api/admin/trial').then(setData); }, []);
+  const stats = data ? [
+    ['Today logins', data.today_login_count],
+    ['New users', data.today_new_users],
+    ['Tasks', data.today_tasks],
+    ['Success tasks', data.today_success_tasks],
+    ['Failed tasks', data.today_failed_tasks],
+    ['Generated images', data.today_generated_images],
+    ['Open feedback', data.feedback_open_count],
+    ['Avg latency', `${data.average_task_latency_ms || 0}ms`],
+  ] : [];
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="Trial Ops" subtitle="Trial usage, feedback, failed tasks, and generated asset summary." />
+      {!data ? <LoadingPanel /> : (
+        <div className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {stats.map(([label, value]) => <div key={label} className="panel"><div className="text-xs text-neutral-500">{label}</div><div className="mt-2 text-2xl font-black">{value}</div></div>)}
+          </div>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <MiniList title="Provider split" rows={data.provider_split} labelKey="provider" />
+            <MiniList title="Most used formats" rows={data.most_used_formats} labelKey="format" />
+            <MiniList title="Failed reasons" rows={data.failed_reason_top_list} labelKey="reason" />
+            <MiniList title="Recent feedback" rows={data.recent_feedback} labelKey="title" onClick={(row) => props.navigate('/admin/feedback')} />
+            <MiniList title="Recent failed tasks" rows={data.recent_failed_tasks} labelKey="product_name" />
+            <MiniList title="Recent assets" rows={data.recent_assets} labelKey="product_name" />
+          </div>
+        </div>
+      )}
+    </AdminShell>
+  );
+}
+
+function AdminFeedbackPage(props) {
+  const [data, setData] = useState(null);
+  const [status, setStatus] = useState('');
+  const [selected, setSelected] = useState(null);
+  const [notes, setNotes] = useState('');
+  const load = () => api(`/api/admin/feedback${status ? `?status=${status}` : ''}`).then(setData);
+  useEffect(load, [status]);
+  const update = async (report, nextStatus) => {
+    const result = await api(`/api/admin/feedback/${report.id}`, { method: 'POST', body: { status: nextStatus, admin_notes: notes || report.admin_notes || '' } });
+    setSelected(result.report);
+    load();
+  };
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="Feedback" subtitle="Trial bug reports, image quality issues, and account questions." />
+      <div className="space-y-4">
+        <div className="panel flex flex-wrap gap-2">
+          {['', 'open', 'reviewing', 'resolved', 'ignored'].map((item) => <button key={item || 'all'} className={`btn ${status === item ? 'btn-yellow' : 'btn-ghost'}`} onClick={() => setStatus(item)}>{item || 'all'}</button>)}
+        </div>
+        {!data ? <LoadingPanel /> : (
+          <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
+            <div className="panel overflow-x-auto">
+              <table className="w-full min-w-[760px] text-left text-sm">
+                <thead className="text-xs text-neutral-500"><tr><th>ID</th><th>Status</th><th>Type</th><th>Severity</th><th>Title</th><th>Task</th><th>Created</th></tr></thead>
+                <tbody>{data.reports.map((report) => (
+                  <tr key={report.id} className="cursor-pointer border-t border-neutral-100" onClick={() => { setSelected(report); setNotes(report.admin_notes || ''); }}>
+                    <td className="py-3">#{report.id}</td><td>{report.status}</td><td>{report.type}</td><td>{report.severity}</td><td>{report.title}</td><td>{report.task_id || '-'}</td><td>{new Date(report.created_at).toLocaleString()}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+            <div className="panel">
+              {!selected ? <div className="text-sm text-neutral-500">Select a feedback report.</div> : (
+                <div className="space-y-3 text-sm">
+                  <div className="text-lg font-black">#{selected.id} {selected.title}</div>
+                  <Row label="Status" value={selected.status} />
+                  <Row label="Type" value={selected.type} />
+                  <Row label="Task" value={selected.task_id || '-'} />
+                  <div className="rounded-lg bg-neutral-50 p-3">{selected.description}</div>
+                  <textarea className="field min-h-24" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Admin notes" />
+                  <div className="flex flex-wrap gap-2">
+                    {['reviewing','resolved','ignored'].map((item) => <button key={item} className="btn btn-ghost" onClick={() => update(selected, item)}>{item}</button>)}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </AdminShell>
+  );
+}
+
+function MiniList({ title, rows = [], labelKey, onClick = null }) {
+  return (
+    <div className="panel">
+      <div className="mb-2 font-black">{title}</div>
+      {!rows?.length ? <div className="text-sm text-neutral-500">No data yet.</div> : (
+        <div className="space-y-2 text-sm">
+          {rows.map((row, index) => (
+            <button key={`${title}-${index}`} onClick={() => onClick?.(row)} className="flex w-full items-center justify-between gap-3 rounded-lg bg-neutral-50 px-3 py-2 text-left">
+              <span className="truncate">{row[labelKey] || row.title || row.id || 'unknown'}</span>
+              <span className="font-black">{row.count ?? row.status ?? ''}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1925,12 +2242,123 @@ function AdminSystemPage(props) {
             <div className="panel"><div className="text-xs text-neutral-500">Storage</div><div className="mt-2 text-2xl font-black">{data.filesystemDisk}</div></div>
             <div className="panel"><div className="text-xs text-neutral-500">Queue</div><div className="mt-2 text-2xl font-black">{data.queueDriver}</div></div>
           </div>
+          {data.securityWarnings?.length > 0 && (
+            <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+              <div className="font-black">Production warnings</div>
+              <ul className="mt-2 list-disc space-y-1 pl-5">
+                {data.securityWarnings.map((warning) => (
+                  <li key={warning.code}>
+                    {warning.blocking ? 'BLOCKING: ' : ''}
+                    {warning.testing_only ? 'Testing only: ' : ''}
+                    {warning.message}
+                    {warning.production_release_status && <span> Production release: {warning.production_release_status}.</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {data.trialMode?.enabled && (
+            <div className="rounded-xl border border-yellow-300 bg-yellow-50 p-4 text-sm text-yellow-900">
+              <div className="font-black">Trial Mode</div>
+              <div>{data.trialMode.message}</div>
+              <div className="mt-1 font-bold">Default admin password is active only for testing. Change before external/public release.</div>
+            </div>
+          )}
+          <div className="panel grid gap-2 text-sm md:grid-cols-2">
+            <Row label="Invite gate" value={data.inviteGate?.enabled ? 'enabled' : 'disabled'} />
+            <Row label="Invite code configured" value={data.inviteGate?.codeConfigured ? 'yes' : 'no'} />
+            <Row label="Trial cleanup" value={data.trialCleanup?.command || 'npm run trial:cleanup'} />
+            <Row label="Cleanup dry run" value={data.trialCleanup?.dryRun ? 'true' : 'false'} />
+          </div>
+          <DomainFixPanel domainFix={data.domainFix} />
+          <ChangePasswordPanel />
           <div className="panel">
             <pre className="max-h-96 overflow-auto rounded-lg bg-neutral-950 p-3 text-xs text-neutral-100">{JSON.stringify(data, null, 2)}</pre>
           </div>
         </div>
       )}
     </AdminShell>
+  );
+}
+
+function DomainFixPanel({ domainFix }) {
+  if (!domainFix) return null;
+  const failed = domainFix.last_status === 'failed';
+  const passed = domainFix.last_status === 'passed';
+  const Icon = passed ? CheckCircle2 : AlertTriangle;
+  const tone = passed ? 'text-green-600' : failed ? 'text-red-600' : 'text-yellow-600';
+  return (
+    <section className="panel space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="font-black">Domain / HTTPS Troubleshooting</div>
+          <div className="mt-1 text-sm text-neutral-500">{domainFix.quick_summary}</div>
+        </div>
+        <Icon className={`h-5 w-5 shrink-0 ${tone}`} />
+      </div>
+      <div className="grid gap-x-6 text-sm md:grid-cols-2">
+        <Row label="APP_URL" value={domainFix.app_url || '-'} />
+        <Row label="PUBLIC_URL" value={domainFix.public_url || '-'} />
+        <Row label="Last domain check" value={domainFix.last_status || 'unknown'} />
+        <Row label="Failed step" value={domainFix.failed_step || '-'} />
+        <Row label="Error code" value={domainFix.error_code || '-'} />
+        <Row label="Guide" value={domainFix.guide?.path || 'NAS_DOMAIN_FIX.md'} />
+      </div>
+      {failed && (
+        <div className="grid gap-4 text-sm md:grid-cols-2">
+          <div>
+            <div className="text-xs font-black uppercase text-neutral-500">Likely root cause</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-neutral-700">
+              {(domainFix.likely_root_cause || []).map((item) => <li key={item}>{item}</li>)}
+            </ul>
+          </div>
+          <div>
+            <div className="text-xs font-black uppercase text-neutral-500">Next manual steps</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-neutral-700">
+              {(domainFix.next_manual_steps || []).map((item) => <li key={item}>{item}</li>)}
+            </ul>
+          </div>
+        </div>
+      )}
+      <div className="border-t border-neutral-100 pt-3 text-sm text-neutral-600">
+        {(domainFix.guide?.summary || []).join(' / ')}
+      </div>
+    </section>
+  );
+}
+
+function ChangePasswordPanel() {
+  const [form, setForm] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const submit = async (event) => {
+    event.preventDefault();
+    setMessage('');
+    setError('');
+    try {
+      await api('/api/auth/change-password', { method: 'POST', body: form });
+      setForm({ current_password: '', new_password: '', confirm_password: '' });
+      setMessage('Password updated.');
+    } catch (err) {
+      setError(err.message || 'Password update failed.');
+    }
+  };
+  return (
+    <form onSubmit={submit} className="panel space-y-3">
+      <div>
+        <div className="font-black">Change admin password</div>
+        <div className="text-sm text-neutral-500">Use this before public trials if the default admin password is still active.</div>
+      </div>
+      <div className="grid gap-3 md:grid-cols-3">
+        <input className="input" type="password" placeholder="Current password" value={form.current_password} onChange={(event) => setForm({ ...form, current_password: event.target.value })} />
+        <input className="input" type="password" placeholder="New password" value={form.new_password} onChange={(event) => setForm({ ...form, new_password: event.target.value })} />
+        <input className="input" type="password" placeholder="Confirm password" value={form.confirm_password} onChange={(event) => setForm({ ...form, confirm_password: event.target.value })} />
+      </div>
+      <div className="text-xs text-neutral-500">Minimum strength: at least 8 characters.</div>
+      {message && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-700">{message}</div>}
+      {error && <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
+      <button className="btn btn-yellow" type="submit">Update password</button>
+    </form>
   );
 }
 
@@ -2115,6 +2543,192 @@ function AdminProvidersPage(props) {
   );
 }
 
+function AdminProviderPlaygroundPage(props) {
+  const [providers, setProviders] = useState([]);
+  const [form, setForm] = useState({ provider: 'fake', capability: 'chat', model: '', prompt: 'Return AI_PING_OK.', labels: 'approved,needs_review,reject', instruction: '', schema: '{"summary":"string"}' });
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  useEffect(() => {
+    api('/api/admin/providers').then((data) => setProviders(data.providers || [])).catch(() => setProviders([]));
+  }, []);
+  const run = async (event) => {
+    event.preventDefault();
+    setError('');
+    setResult(null);
+    try {
+      const data = await api('/api/admin/provider-playground', { method: 'POST', body: form });
+      setResult(data);
+    } catch (err) {
+      setError(err.message || 'Provider playground request failed.');
+    }
+  };
+  const saveTemplate = async () => {
+    const key = `playground_${form.capability}_${Date.now()}`;
+    await api('/api/admin/prompts', {
+      method: 'POST',
+      body: {
+        key,
+        name: `Playground ${form.capability}`,
+        tool_type: form.capability,
+        capability: form.capability,
+        user_prompt_template: form.prompt,
+        template_body: form.prompt,
+        variables_json: JSON.stringify({ labels: form.labels, instruction: form.instruction, schema: form.schema }),
+        is_active: 0,
+        version: 1,
+        notes: 'Saved from provider playground.',
+      },
+    });
+    setMessage(`Saved prompt template ${key}.`);
+  };
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="Provider Playground" subtitle="Run safe text capabilities for configured providers. Secrets are never returned." />
+      <form onSubmit={run} className="panel space-y-4">
+        <div className="grid gap-3 md:grid-cols-4">
+          <select className="input" value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}>
+            {providers.map((provider) => <option key={provider.name} value={provider.name}>{provider.label || provider.name}</option>)}
+          </select>
+          <select className="input" value={form.capability} onChange={(event) => setForm({ ...form, capability: event.target.value })}>
+            {['chat', 'generate', 'summary', 'classification', 'rewrite', 'extraction', 'planning', 'prompt_rewrite'].map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+          <input className="input" placeholder="Model override" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />
+          <button className="btn btn-yellow" type="submit">Run</button>
+        </div>
+        <textarea className="input min-h-[160px]" value={form.prompt} onChange={(event) => setForm({ ...form, prompt: event.target.value })} />
+        <div className="grid gap-3 md:grid-cols-3">
+          {form.capability === 'classification' && <input className="input" placeholder="labels" value={form.labels} onChange={(event) => setForm({ ...form, labels: event.target.value })} />}
+          {['rewrite', 'prompt_rewrite'].includes(form.capability) && <input className="input" placeholder="instruction / goal" value={form.instruction} onChange={(event) => setForm({ ...form, instruction: event.target.value })} />}
+          {form.capability === 'extraction' && <textarea className="input min-h-[90px]" placeholder="schema JSON" value={form.schema} onChange={(event) => setForm({ ...form, schema: event.target.value })} />}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className="btn btn-ghost" onClick={saveTemplate}>Save as prompt template</button>
+          {result?.output && <button type="button" className="btn btn-ghost" onClick={() => navigator.clipboard?.writeText(result.output)}>Copy output</button>}
+        </div>
+        {message && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-700">{message}</div>}
+        {error && <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
+        {result && <pre className="max-h-96 overflow-auto rounded-lg bg-neutral-950 p-3 text-xs text-neutral-100">{JSON.stringify(result, null, 2)}</pre>}
+      </form>
+    </AdminShell>
+  );
+}
+
+function AdminDevPilotPage(props) {
+  const [data, setData] = useState(null);
+  const [source, setSource] = useState('');
+  const [message, setMessage] = useState('');
+  const load = () => {
+    const query = new URLSearchParams();
+    if (source) query.set('source_system', source);
+    api(`/api/admin/devpilot?${query.toString()}`).then(setData);
+  };
+  useEffect(() => { load(); }, []);
+  const markReviewed = async (id) => {
+    await api(`/api/admin/handoffs/${id}/reviewed`, { method: 'POST' });
+    setMessage(`Handoff #${id} marked reviewed.`);
+    load();
+  };
+  const runTestSuite = async () => {
+    const result = await api('/api/admin/devpilot/test-suite', { method: 'POST', body: {} });
+    setMessage(`DevPilot UI test suite ${result.ok ? 'passed' : 'failed'}. Raw key returned: ${result.raw_key_returned ? 'yes' : 'no'}`);
+    load();
+  };
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="DevPilot" subtitle="External handoff activity, source usage, and integration toolbox access." />
+      {!data ? <LoadingPanel /> : (
+        <div className="space-y-4">
+          {message && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-700">{message}</div>}
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="panel"><div className="text-xs text-neutral-500">Active DB keys</div><div className="mt-2 text-2xl font-black">{data.activeKeyCount}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Env keys</div><div className="mt-2 text-2xl font-black">{data.configuredEnvKeys ? 'yes' : 'no'}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Rate limit</div><div className="mt-2 text-2xl font-black">{data.rateLimit?.enabled ? 'on' : 'off'}</div></div>
+            <div className="panel"><div className="text-xs text-neutral-500">Toolbox resources</div><div className="mt-2 text-2xl font-black">{data.toolboxResources?.length || 0}</div></div>
+          </div>
+          <div className="panel flex flex-wrap gap-3">
+            <input className="input max-w-xs" placeholder="Filter source" value={source} onChange={(event) => setSource(event.target.value)} />
+            <button className="btn btn-ghost" onClick={load}>Apply</button>
+            <button className="btn btn-ghost" onClick={() => props.navigate('/admin/integration-toolbox')}>Open toolbox</button>
+            <button className="btn btn-ghost" onClick={() => props.navigate('/admin/devpilot/handoffs')}>Open handoffs</button>
+            <button className="btn btn-yellow" onClick={runTestSuite}>Run UI test suite</button>
+          </div>
+          <div className="panel overflow-auto">
+            <table className="w-full min-w-[720px] text-left text-sm">
+              <thead><tr className="text-xs text-neutral-500"><th className="py-2">ID</th><th>Source</th><th>Status</th><th>Risk</th><th>External ref</th><th>From</th><th>To</th><th></th></tr></thead>
+              <tbody>
+                {data.recentHandoffs?.map((handoff) => (
+                  <tr key={handoff.handoff_id} className="border-t border-neutral-100">
+                    <td className="py-2 font-mono">#{handoff.handoff_id}</td>
+                    <td>{handoff.source_system}</td>
+                    <td>{handoff.status}</td>
+                    <td>{handoff.risk}</td>
+                    <td>{handoff.external_ref || '-'}</td>
+                    <td>{handoff.from_agent}</td>
+                    <td>{handoff.to_agent}</td>
+                    <td className="text-right"><button className="btn btn-ghost px-3 py-1" onClick={() => markReviewed(handoff.handoff_id)}>Mark reviewed</button></td>
+                  </tr>
+                ))}
+                {!data.recentHandoffs?.length && <tr><td colSpan="8" className="py-8 text-center text-neutral-500">No handoffs found.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </AdminShell>
+  );
+}
+
+function AdminDevPilotHandoffsPage(props) {
+  const [data, setData] = useState(null);
+  const [filters, setFilters] = useState({ source_system: '', status: '', risk: '', external_ref: '', task_id: '' });
+  const [message, setMessage] = useState('');
+  const load = () => {
+    const query = new URLSearchParams(Object.entries(filters).filter(([, value]) => value));
+    api(`/api/admin/devpilot/handoffs?${query}`).then(setData);
+  };
+  useEffect(load, []);
+  const markReviewed = async (id) => {
+    await api(`/api/admin/handoffs/${id}/reviewed`, { method: 'POST' });
+    setMessage(`Handoff #${id} marked reviewed.`);
+    load();
+  };
+  return (
+    <AdminShell {...props}>
+      <PageTitle title="DevPilot Handoffs" subtitle="Filter handoffs, inspect redacted payload summaries, and copy placeholder snippets." />
+      <div className="space-y-4">
+        {message && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-700">{message}</div>}
+        <div className="panel grid gap-2 md:grid-cols-6">
+          {Object.keys(filters).map((key) => (
+            <input key={key} className="field" placeholder={key} value={filters[key]} onChange={(event) => setFilters({ ...filters, [key]: event.target.value })} />
+          ))}
+          <button className="btn btn-primary" onClick={load}>Filter</button>
+        </div>
+        {!data ? <LoadingPanel /> : (
+          <div className="panel overflow-x-auto">
+            <table className="w-full min-w-[1040px] text-left text-xs">
+              <thead className="text-neutral-500"><tr><th className="py-2">ID</th><th>Task</th><th>Source</th><th>Status</th><th>Risk</th><th>External ref</th><th>Idempotency</th><th>Payload</th><th></th></tr></thead>
+              <tbody>{data.handoffs?.map((handoff) => (
+                <tr key={handoff.handoff_id} className="border-t border-neutral-100 align-top">
+                  <td className="py-3">#{handoff.handoff_id}</td>
+                  <td>#{handoff.task_id}</td>
+                  <td>{handoff.source_system}</td>
+                  <td>{handoff.status}</td>
+                  <td>{handoff.risk}</td>
+                  <td>{handoff.external_ref || '-'}</td>
+                  <td className="font-mono">{handoff.idempotency_key_masked || '-'}</td>
+                  <td><pre className="max-h-32 overflow-auto rounded bg-neutral-100 p-2">{JSON.stringify(handoff.safe_payload_summary || {}, null, 2)}</pre></td>
+                  <td><button className="btn btn-ghost px-2 py-1" onClick={() => markReviewed(handoff.handoff_id)}>Reviewed</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </AdminShell>
+  );
+}
+
 function AdminAssetsPage(props) {
   const [data, setData] = useState(null);
   const [q, setQ] = useState('');
@@ -2287,6 +2901,85 @@ function LoginRequired({ openAuth }) {
         <h1 className="mt-3 text-xl font-black">請先登入</h1>
         <p className="mt-2 text-sm text-neutral-500">登入後即可查看會員後台、任務紀錄與素材庫。</p>
         <button onClick={() => openAuth('login')} className="btn btn-yellow mt-5">登入 / 註冊</button>
+      </div>
+    </main>
+  );
+}
+
+function FeedbackPage({ user, navigate }) {
+  const params = new URLSearchParams(window.location.search);
+  const [form, setForm] = useState({
+    type: 'bug',
+    severity: 'medium',
+    title: '',
+    description: '',
+    task_id: params.get('task_id') || '',
+    asset_url: params.get('asset_url') || '',
+    browser_info: navigator.userAgent || '',
+  });
+  const [ticket, setTicket] = useState(null);
+  const [error, setError] = useState('');
+  const submit = async (event) => {
+    event.preventDefault();
+    setError('');
+    try {
+      const result = await api('/api/feedback', { method: 'POST', body: form });
+      setTicket(result.report);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+  return (
+    <main className="mx-auto max-w-3xl px-4 py-8">
+      <PageTitle title="Feedback" subtitle="Report a bug, image quality issue, or trial account problem." />
+      <form onSubmit={submit} className="panel space-y-3">
+        {ticket && <div className="rounded-lg bg-green-50 p-3 text-sm font-black text-green-700">Ticket #{ticket.id} submitted.</div>}
+        <div className="grid gap-3 md:grid-cols-2">
+          <div><label className="label">Type</label><select className="field" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}>{['bug','quality','billing','account','other'].map((item) => <option key={item} value={item}>{item}</option>)}</select></div>
+          <div><label className="label">Severity</label><select className="field" value={form.severity} onChange={(e) => setForm({ ...form, severity: e.target.value })}>{['low','medium','high'].map((item) => <option key={item} value={item}>{item}</option>)}</select></div>
+        </div>
+        <div><label className="label">Title</label><input className="field" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></div>
+        <div><label className="label">Description</label><textarea className="field min-h-32" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div><label className="label">Task ID</label><input className="field" value={form.task_id} onChange={(e) => setForm({ ...form, task_id: e.target.value })} /></div>
+          <div><label className="label">Asset URL</label><input className="field" value={form.asset_url} onChange={(e) => setForm({ ...form, asset_url: e.target.value })} /></div>
+        </div>
+        {error && <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
+        <div className="flex gap-2">
+          <button className="btn btn-primary">Submit feedback</button>
+          {user && <button type="button" className="btn btn-ghost" onClick={() => navigate('/tasks')}>Back to tasks</button>}
+        </div>
+      </form>
+    </main>
+  );
+}
+
+function SharePage({ token }) {
+  const [asset, setAsset] = useState(null);
+  const [error, setError] = useState('');
+  const [imageError, setImageError] = useState(false);
+  useEffect(() => {
+    api(`/api/share/${encodeURIComponent(token)}`).then((data) => setAsset(data.asset)).catch((err) => setError(err.message));
+  }, [token]);
+  if (error) return <main className="mx-auto max-w-xl px-4 py-16"><div className="panel"><h1 className="text-xl font-black">Share link not found</h1><p className="mt-2 text-sm text-neutral-600">這個分享連結不存在、已撤銷，或圖片已被清理。</p></div></main>;
+  if (!asset) return <main className="mx-auto max-w-xl px-4 py-16"><LoadingPanel /></main>;
+  return (
+    <main className="mx-auto max-w-4xl px-4 py-8">
+      <PageTitle title={asset.product_name || 'Shared asset'} subtitle="Public share view" />
+      <div className="panel">
+        <img src={asset.image_url} className="max-h-[70vh] w-full rounded-lg bg-white object-contain" alt="" onError={() => setImageError(true)} />
+        {imageError && <div className="mt-3 rounded-lg bg-yellow-50 p-3 text-sm font-bold text-yellow-700">圖片載入失敗，請稍後重試或回報問題。</div>}
+        <div className="mt-4 flex flex-wrap gap-2">
+          <a href={asset.image_url} download className="btn btn-yellow gap-2"><Download className="h-4 w-4" />Download</a>
+          <button className="btn btn-ghost" onClick={() => { window.location.href = `/feedback?asset_url=${encodeURIComponent(asset.image_url)}`; }}>Report image issue</button>
+        </div>
+        <div className="mt-3 text-sm font-bold text-neutral-500">由 imageai.tw 生成</div>
+        <div className="mt-4 grid gap-2 text-sm md:grid-cols-2">
+          <Row label="Task" value={`#${asset.task_id}`} />
+          <Row label="Format" value={asset.format || '-'} />
+          <Row label="Tool" value={asset.tool_type || '-'} />
+          <Row label="Created" value={asset.created_at ? new Date(asset.created_at).toLocaleString() : '-'} />
+        </div>
       </div>
     </main>
   );

@@ -1,12 +1,19 @@
 import bcrypt from 'bcryptjs';
-import { now, transaction } from '../db/database.js';
+import { now, run, transaction } from '../db/database.js';
 import { CreditTransaction, User } from '../models/index.js';
 import { config } from '../config/index.js';
 
 export class AuthService {
-  async register({ name, email, password, terms }) {
+  async register({ name, email, password, terms, invite_code }) {
     if (!config.registrationEnabled) {
       throw authError('Registration is currently disabled.', 403);
+    }
+    if (config.inviteCodeEnabled) {
+      const expected = String(config.trialInviteCode || '');
+      const provided = String(invite_code || '').trim();
+      if (!expected || provided !== expected) {
+        throw authError('Invite code is required for this trial registration.', 403);
+      }
     }
     if (!terms) {
       throw authError('請勾選 AI 工具使用條款', 422);
@@ -56,8 +63,19 @@ export class AuthService {
     if (user.status !== 'active') {
       throw authError('帳號已停權', 403);
     }
+    run('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?', [now(), now(), user.id]);
     return User.find(user.id);
   }
+}
+
+export function adminBootstrapPolicySummary() {
+  return {
+    username: config.admin.bootstrapUsername,
+    password_configured: config.admin.bootstrapPasswordConfigured,
+    password_weak: config.admin.isWeakPassword(config.admin.bootstrapPassword),
+    allow_default_password: config.admin.allowDefaultPassword,
+    require_secure_password: config.admin.requireSecurePassword,
+  };
 }
 
 function authError(message, status = 401) {

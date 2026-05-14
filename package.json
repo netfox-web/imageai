@@ -26,6 +26,10 @@
     "devpilot:local": "node server/cli/devpilot-local-integration.js",
     "rc:local": "node server/cli/rc-local.js",
     "ai:ping": "node server/cli/ai-ping.js",
+    "domain:check": "node server/cli/domain-check.js",
+    "domain:manual-guide": "node server/cli/domain-manual-guide.js",
+    "trial:check": "node server/cli/trial-check.js",
+    "trial:cleanup": "node server/cli/trial-cleanup.js",
     "test": "vitest run"
   },
   "keywords": [],
