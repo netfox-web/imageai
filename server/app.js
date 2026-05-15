@@ -70,6 +70,7 @@ import {
   listIntegrationToolboxResources,
 } from './services/IntegrationToolboxService.js';
 import { buildDomainActionOutput, readLastDomainCheck } from './services/DomainDiagnostics.js';
+import { redactSensitiveText } from './services/CopywritingService.js';
 import {
   createFeedbackReport,
   getFeedbackReport,
@@ -342,11 +343,12 @@ function registerExternalApiRoutes(app) {
 
 function registerPublicRoutes(app) {
   const authLimiter = createRateLimiter(20);
-  app.get('/share/:token', (req, res, next) => {
+  app.get('/share/:token', async (req, res, next) => {
     try {
       const asset = getSharedAsset(req.params.token);
       if (!asset) return res.status(404).type('html').send(renderShareNotFoundPage());
-      res.type('html').send(renderSharePage(asset));
+      const textContent = await readSharedTextAsset(asset);
+      res.type('html').send(renderSharePage(asset, textContent));
     } catch (error) {
       next(error);
     }
@@ -356,29 +358,30 @@ function registerPublicRoutes(app) {
     try {
       const asset = getSharedAsset(req.params.token);
       if (!asset) throw httpError('Share link not found.', 404);
-      if (config.filesystemDisk === 'local') {
-        const filePath = resolveStoragePath(asset.storage_path);
-        if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-          throw httpError('Shared file not found.', 404);
-        }
-        return res.sendFile(filePath);
-      }
-      if (!(await storageService.exists(asset.storage_path))) {
-        throw httpError('Shared file not found.', 404);
-      }
-      const buffer = await storageService.read(asset.storage_path);
-      res.type(asset.mime_type || path.extname(asset.storage_path) || 'application/octet-stream');
-      return res.send(buffer);
+      return sendSharedAssetFile(res, asset);
     } catch (error) {
       return next(error);
     }
   });
 
-  app.get('/api/share/:token', (req, res, next) => {
+  app.get('/share/:token/download', async (req, res, next) => {
+    try {
+      const asset = getSharedAsset(req.params.token);
+      if (!asset) throw httpError('Share link not found.', 404);
+      return sendSharedAssetFile(res, asset, { attachment: true });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get('/api/share/:token', async (req, res, next) => {
     try {
       const asset = getSharedAsset(req.params.token);
       if (!asset) throw httpError('Share link not found.', 404);
       const { storage_path, ...safeAsset } = asset;
+      if (isTextAsset(asset)) {
+        safeAsset.text = await readSharedTextAsset(asset);
+      }
       res.json({ asset: safeAsset });
     } catch (error) {
       next(error);
@@ -1774,11 +1777,60 @@ function runDevPilotUiTestSuite({ adminUserId, req }) {
   };
 }
 
-function renderSharePage(asset) {
+const maxPublicTextShareLength = 20000;
+
+function isTextAsset(asset) {
+  return String(asset?.mime_type || '').startsWith('text/');
+}
+
+async function readSharedTextAsset(asset) {
+  if (!isTextAsset(asset)) return '';
+  const buffer = config.filesystemDisk === 'local'
+    ? readLocalSharedAsset(asset)
+    : await readObjectSharedAsset(asset);
+  return redactSensitiveText(buffer.toString('utf8')).slice(0, maxPublicTextShareLength);
+}
+
+function readLocalSharedAsset(asset) {
+  const filePath = resolveStoragePath(asset.storage_path);
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    throw httpError('Shared file not found.', 404);
+  }
+  return fs.readFileSync(filePath);
+}
+
+async function readObjectSharedAsset(asset) {
+  if (!(await storageService.exists(asset.storage_path))) {
+    throw httpError('Shared file not found.', 404);
+  }
+  return storageService.read(asset.storage_path);
+}
+
+async function sendSharedAssetFile(res, asset, options = {}) {
+  const buffer = config.filesystemDisk === 'local'
+    ? readLocalSharedAsset(asset)
+    : await readObjectSharedAsset(asset);
+  const mimeType = asset.mime_type || path.extname(asset.storage_path) || 'application/octet-stream';
+  if (options.attachment) {
+    res.setHeader('Content-Disposition', `attachment; filename="${asset.download_filename || 'imageai-asset'}"`);
+  }
+  res.type(mimeType);
+  return res.send(buffer);
+}
+
+function renderSharePage(asset, textContent = '') {
+  const textAsset = isTextAsset(asset);
   const title = escapeHtml(asset.product_name || 'Shared asset');
+  if (textAsset) return renderTextSharePage(asset, title, textContent);
   const description = `由 imageai.tw 生成${asset.format ? ` - ${asset.format}` : ''}`;
   const imageUrl = escapeHtml(asset.image_url || '');
-  const feedbackUrl = `/feedback?asset_url=${encodeURIComponent(asset.image_url || `/share/${asset.token || ''}`)}`;
+  const feedbackTarget = asset.download_url || asset.image_url || `/share/${asset.token || ''}`;
+  const feedbackUrl = `/feedback?asset_url=${encodeURIComponent(feedbackTarget)}`;
+  const bodyContent = textAsset
+    ? `<div class="text-output"><pre>${escapeHtml(textContent || 'No copy output available.')}</pre></div>`
+    : `<img src="${imageUrl}" alt="${title}" onerror="this.insertAdjacentHTML('afterend','<p class=&quot;hint&quot;>??頛憭望?嚗?蝔??岫???勗?憿?/p>')">`;
+  const downloadLabel = textAsset ? 'Download TXT' : '銝???';
+  const reportLabel = textAsset ? 'Report copy issue' : '?????';
   return `<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -1793,6 +1845,8 @@ function renderSharePage(asset) {
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #f7f7f4; color: #111; }
     main { max-width: 920px; margin: 0 auto; padding: 32px 16px; }
     img { width: 100%; max-height: 75vh; object-fit: contain; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+    .text-output { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     dl { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; font-size: 14px; }
     dt { color: #666; } dd { margin: 0; font-weight: 700; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
@@ -1808,6 +1862,51 @@ function renderSharePage(asset) {
     <div class="actions">
       <a class="btn" href="${imageUrl}" download>下載圖片</a>
       <a class="btn" href="${feedbackUrl}">回報圖片問題</a>
+    </div>
+    <dl>
+      <dt>Task</dt><dd>#${Number(asset.task_id)}</dd>
+      <dt>Format</dt><dd>${escapeHtml(asset.format || '-')}</dd>
+      <dt>Tool</dt><dd>${escapeHtml(asset.tool_type || '-')}</dd>
+      <dt>Created</dt><dd>${escapeHtml(asset.created_at || '-')}</dd>
+    </dl>
+  </main>
+</body>
+</html>`;
+}
+
+function renderTextSharePage(asset, title, textContent = '') {
+  const description = `Copywriting output generated by imageai.tw${asset.format ? ` - ${asset.format}` : ''}`;
+  const downloadUrl = escapeHtml(asset.download_url || asset.content_url || '');
+  const feedbackUrl = `/feedback?asset_url=${encodeURIComponent(asset.download_url || asset.content_url || `/share/${asset.token || ''}`)}`;
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title}</title>
+  <meta name="description" content="${escapeHtml(description)}">
+  <meta property="og:title" content="${title}">
+  <meta property="og:description" content="${escapeHtml(description)}">
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #f7f7f4; color: #111; }
+    main { max-width: 920px; margin: 0 auto; padding: 32px 16px; }
+    .text-output { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    dl { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; font-size: 14px; }
+    dt { color: #666; } dd { margin: 0; font-weight: 700; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+    .btn { border: 1px solid #111; border-radius: 8px; color: #111; display: inline-block; font-weight: 800; padding: 10px 14px; text-decoration: none; }
+    .hint { color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${title}</h1>
+    <p class="hint">Copywriting output generated by imageai.tw</p>
+    <div class="text-output"><pre>${escapeHtml(textContent || 'No copy output available.')}</pre></div>
+    <div class="actions">
+      <a class="btn" href="${downloadUrl}" download>Download TXT</a>
+      <a class="btn" href="${feedbackUrl}">Report copy issue</a>
     </div>
     <dl>
       <dt>Task</dt><dd>#${Number(asset.task_id)}</dd>

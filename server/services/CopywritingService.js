@@ -77,7 +77,7 @@ function normalizeCopyText(text) {
   return content || 'No copy generated.';
 }
 
-function redactSensitiveText(text) {
+export function redactSensitiveText(text) {
   return text
     .replace(/\b(sk-[A-Za-z0-9_-]{10,})\b/g, '[redacted-api-key]')
     .replace(/\b(api[_-]?key|secret|token|password)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')

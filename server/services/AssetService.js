@@ -202,11 +202,17 @@ export function getSharedAsset(token) {
     [String(token)],
   );
   if (!row) return null;
+  const assetKind = String(row.mime_type || '').startsWith('text/') ? 'text' : 'image';
+  const shareBase = `/share/${encodeURIComponent(row.token)}`;
   return {
     id: row.id,
     task_id: row.task_id,
     storage_path: row.storage_path,
-    image_url: `/share/${encodeURIComponent(row.token)}/image`,
+    asset_kind: assetKind,
+    image_url: assetKind === 'image' ? `${shareBase}/image` : null,
+    content_url: `${shareBase}/image`,
+    download_url: `${shareBase}/download`,
+    download_filename: sharedDownloadFilename({ ...row, asset_kind: assetKind }),
     product_name: row.product_name || row.main_title || 'Shared asset',
     tool_type: row.tool_type,
     format: row.format_name || '',
@@ -217,6 +223,20 @@ export function getSharedAsset(token) {
     tags: safeTags(row.tags),
     created_at: row.created_at,
   };
+}
+
+function sharedDownloadFilename(asset) {
+  const extension = asset.asset_kind === 'text' ? '.txt' : extensionForMime(asset.mime_type);
+  const prefix = asset.asset_kind === 'text' ? 'copywriting' : 'imageai';
+  return `${prefix}-task-${Number(asset.task_id) || 'asset'}${extension}`;
+}
+
+function extensionForMime(mimeType = '') {
+  if (String(mimeType).includes('jpeg')) return '.jpg';
+  if (String(mimeType).includes('png')) return '.png';
+  if (String(mimeType).includes('webp')) return '.webp';
+  if (String(mimeType).startsWith('text/')) return '.txt';
+  return '.bin';
 }
 
 export function updateAssetMetadata({ user, assetId, body = {}, admin = false, req = null }) {
