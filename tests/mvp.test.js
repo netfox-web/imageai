@@ -304,6 +304,12 @@ describe('AI commerce generator MVP', () => {
     const assets = await agent.get('/api/assets?type=output');
     const asset = assets.body.assets.find((item) => item.task_id === response.body.task_id && item.mime_type === 'text/plain');
     expect(asset).toBeTruthy();
+    const storedAsset = get('SELECT storage_path FROM task_images WHERE id = ?', [asset.id]);
+    fs.writeFileSync(
+      resolveStoragePath(storedAsset.storage_path),
+      `Reusable Bottle\napi_key=abc123\n/volume1/web/ai-copy/.env_secret.php\nC:\\Users\\home\\Documents\\imageai\\.env\n${fakeApiKey}`,
+      'utf8',
+    );
 
     const share = await agent.post(`/api/assets/${asset.id}/share`).set('x-csrf-token', token).send({});
     expect(share.status).toBe(200);
@@ -341,6 +347,9 @@ describe('AI commerce generator MVP', () => {
     expect(download.headers['content-disposition']).toContain(`copywriting-task-${response.body.task_id}.txt`);
     expect(download.text).toContain('Reusable Bottle');
     expect(download.text).not.toContain('abc123');
+    expect(download.text).not.toContain('/volume1/web');
+    expect(download.text).not.toContain('C:\\Users\\home');
+    expect(download.text).not.toContain(fakeApiKey);
   });
 
   it('使用者不能看別人的任務', async () => {

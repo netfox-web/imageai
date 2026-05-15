@@ -1807,13 +1807,18 @@ async function readObjectSharedAsset(asset) {
 }
 
 async function sendSharedAssetFile(res, asset, options = {}) {
-  const buffer = config.filesystemDisk === 'local'
-    ? readLocalSharedAsset(asset)
-    : await readObjectSharedAsset(asset);
   const mimeType = asset.mime_type || path.extname(asset.storage_path) || 'application/octet-stream';
   if (options.attachment) {
     res.setHeader('Content-Disposition', `attachment; filename="${asset.download_filename || 'imageai-asset'}"`);
   }
+  if (isTextAsset(asset)) {
+    // Keep public text downloads on the same redaction boundary as API and HTML shares.
+    res.type(mimeType);
+    return res.send(await readSharedTextAsset(asset));
+  }
+  const buffer = config.filesystemDisk === 'local'
+    ? readLocalSharedAsset(asset)
+    : await readObjectSharedAsset(asset);
   res.type(mimeType);
   return res.send(buffer);
 }
@@ -1826,11 +1831,6 @@ function renderSharePage(asset, textContent = '') {
   const imageUrl = escapeHtml(asset.image_url || '');
   const feedbackTarget = asset.download_url || asset.image_url || `/share/${asset.token || ''}`;
   const feedbackUrl = `/feedback?asset_url=${encodeURIComponent(feedbackTarget)}`;
-  const bodyContent = textAsset
-    ? `<div class="text-output"><pre>${escapeHtml(textContent || 'No copy output available.')}</pre></div>`
-    : `<img src="${imageUrl}" alt="${title}" onerror="this.insertAdjacentHTML('afterend','<p class=&quot;hint&quot;>??頛憭望?嚗?蝔??岫???勗?憿?/p>')">`;
-  const downloadLabel = textAsset ? 'Download TXT' : '銝???';
-  const reportLabel = textAsset ? 'Report copy issue' : '?????';
   return `<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -1845,8 +1845,6 @@ function renderSharePage(asset, textContent = '') {
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #f7f7f4; color: #111; }
     main { max-width: 920px; margin: 0 auto; padding: 32px 16px; }
     img { width: 100%; max-height: 75vh; object-fit: contain; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
-    .text-output { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
-    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     dl { display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; font-size: 14px; }
     dt { color: #666; } dd { margin: 0; font-weight: 700; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
