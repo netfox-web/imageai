@@ -6,7 +6,7 @@ import { GeminiProvider } from './providers/GeminiProvider.js';
 import { ClaudeProvider } from './providers/ClaudeProvider.js';
 import { DevPilotGatewayProvider } from './providers/DevPilotGatewayProvider.js';
 
-const baseCapabilities = ['summary', 'classification', 'rewrite', 'extraction', 'planning', 'chat', 'generate'];
+const baseCapabilities = ['summary', 'classification', 'rewrite', 'extraction', 'planning', 'chat', 'generate', 'copywriting'];
 const imageCapabilities = ['image_generation', 'image_editing', 'image_variation', 'prompt_rewrite'];
 
 function hasValue(value) {

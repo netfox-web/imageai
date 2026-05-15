@@ -111,6 +111,27 @@ async function createBannerTask(agent, token, overrides = {}) {
   return req.attach('images', png, { filename: 'product.png', contentType: 'image/png' });
 }
 
+async function createCopywritingTask(agent, token, overrides = {}) {
+  let req = agent
+    .post('/studio/tasks')
+    .set('x-csrf-token', token)
+    .field('tool_type', 'copywriting')
+    .field('product_name', overrides.product_name || 'Reusable Bottle')
+    .field('main_title', overrides.main_title || 'Hydration That Travels')
+    .field('subtitle', overrides.subtitle || 'Leakproof daily bottle')
+    .field('custom_prompt', overrides.custom_prompt || 'BPA-free, matte texture, commuter friendly')
+    .field('language', overrides.language || 'en')
+    .field('provider', overrides.provider || '')
+    .field('model', overrides.model || '')
+    .field('capability', overrides.capability || 'copywriting')
+    .field('strict_provider', String(overrides.strict_provider || false));
+
+  if (overrides.attachImage) {
+    req = req.attach('images', png, { filename: 'product.png', contentType: 'image/png' });
+  }
+  return req;
+}
+
 async function waitFor(predicate, timeout = 800) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
@@ -200,6 +221,73 @@ describe('AI commerce generator MVP', () => {
     expect(response.status).toBe(201);
     const images = all('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'input']);
     expect(images).toHaveLength(1);
+  });
+
+  it('copywriting tasks require authentication', async () => {
+    const agent = request.agent(app);
+    const token = await csrf(agent);
+    const response = await createCopywritingTask(agent, token);
+    expect(response.status).toBe(401);
+  });
+
+  it('copywriting cost uses text task pricing', async () => {
+    const previousFakeCost = config.fakeTaskCost;
+    config.fakeTaskCost = 0;
+    expect(creditService.calculateTaskCost({ tool_type: 'copywriting', provider: 'fake' })).toBe(0);
+    expect(creditService.calculateTaskCost({ tool_type: 'copywriting', provider: 'openai' })).toBe(1);
+    config.fakeTaskCost = previousFakeCost;
+  });
+
+  it('FakeAIProvider writes copywriting output as a protected text asset', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'copywriter@example.com');
+    run('UPDATE users SET credits_balance = 10 WHERE id = ?', [user.id]);
+
+    const response = await createCopywritingTask(agent, token);
+    expect(response.status).toBe(201);
+    expect(response.body.credits_cost).toBe(0);
+    expect(await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'success')).toBe(true);
+
+    const taskResponse = await agent.get(`/api/tasks/${response.body.task_id}`);
+    expect(taskResponse.status).toBe(200);
+    expect(taskResponse.body.task.tool_type).toBe('copywriting');
+    expect(taskResponse.body.task.output_images).toHaveLength(0);
+    expect(taskResponse.body.task.text_outputs).toHaveLength(1);
+
+    const output = taskResponse.body.task.text_outputs[0];
+    expect(output.mime_type).toBe('text/plain');
+    expect(output.storage_path).toMatch(/^outputs\//);
+    expect(output.url).toMatch(/^\/storage\/outputs\//);
+    const body = fs.readFileSync(resolveStoragePath(output.storage_path), 'utf8');
+    expect(body).toContain('Reusable Bottle');
+
+    const unauthenticated = await request(app).get(output.url);
+    expect([401, 403]).toContain(unauthenticated.status);
+
+    const assets = await agent.get('/api/assets?type=output');
+    expect(assets.body.assets.some((asset) => asset.task_id === response.body.task_id && asset.mime_type === 'text/plain')).toBe(true);
+  });
+
+  it('copywriting output and logs redact obvious secrets and private storage paths', async () => {
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'copywriting-redaction@example.com');
+    run('UPDATE users SET credits_balance = 10 WHERE id = ?', [user.id]);
+    const sensitive = 'api_key=abc123 /volume1/web/ai-copy/.env_secret.php C:\\Users\\home\\Documents\\imageai\\.env sk-abcdefghijklmnop';
+
+    const response = await createCopywritingTask(agent, token, { custom_prompt: sensitive });
+    expect(response.status).toBe(201);
+    expect(await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'success')).toBe(true);
+
+    const output = get('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'output']);
+    const body = fs.readFileSync(resolveStoragePath(output.storage_path), 'utf8');
+    const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ?', [response.body.task_id]);
+    const serialized = `${body}\n${log.raw_response_json}`;
+
+    expect(serialized).not.toContain('abc123');
+    expect(serialized).not.toContain('/volume1/web');
+    expect(serialized).not.toContain('C:\\Users\\home');
+    expect(serialized).not.toContain('.env_secret');
+    expect(serialized).not.toContain('sk-abcdefghijklmnop');
   });
 
   it('使用者不能看別人的任務', async () => {
@@ -708,6 +796,41 @@ describe('AI commerce generator MVP', () => {
     expect(outputs).toHaveLength(4);
     expect(outputs.every((output) => output.storage_path.startsWith('outputs/'))).toBe(true);
     config.queueDriver = previousDriver;
+  });
+
+  it('OpenAIProvider generateProductCopy uses the text provider path', async () => {
+    const provider = new OpenAIProvider({
+      client: {
+        responses: {
+          create: async (payload) => {
+            expect(payload.input).toContain('Serum');
+            return {
+              output_text: 'Title: Serum Glow\nCTA: Try the routine today.',
+              usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20 },
+            };
+          },
+        },
+      },
+    });
+
+    const outputs = await provider.generateProductCopy({
+      id: 77,
+      product_name: 'Serum',
+      main_title: 'Serum Glow',
+      subtitle: 'Daily brightening care',
+      custom_prompt: 'lightweight texture',
+      language: 'en',
+      resolved_model: 'gpt-test',
+    });
+    const metadata = provider.consumeLastRunMetadata();
+
+    expect(outputs).toHaveLength(1);
+    expect(outputs[0].mime_type).toBe('text/plain');
+    expect(fs.readFileSync(resolveStoragePath(outputs[0].storage_path), 'utf8')).toContain('Serum Glow');
+    expect(metadata.provider).toBe('openai');
+    expect(metadata.model).toBe('gpt-test');
+    expect(metadata.output_type).toBe('copywriting');
+    expect(metadata.image_count).toBe(0);
   });
 
   it('OpenAIProvider generateBanner stores base64 images and omits full base64 from raw metadata', async () => {

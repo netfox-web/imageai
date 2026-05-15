@@ -2,6 +2,11 @@ import path from 'node:path';
 import { AIProviderInterface } from './AIProviderInterface.js';
 import { GenerationTask } from '../models/index.js';
 import { storageService } from './StorageService.js';
+import {
+  buildFakeProductCopy,
+  normalizeTextResultMetadata,
+  persistProductCopyOutput,
+} from './CopywritingService.js';
 
 const roleCycle = ['cover', 'scenario', 'detail', 'feature', 'white_bg', 'comparison', 'multi_use', 'info'];
 
@@ -93,6 +98,23 @@ export class FakeAIProvider extends AIProviderInterface {
 
   async removeText(task) {
     return this.copyAllInputs(task);
+  }
+
+  async generateProductCopy(task) {
+    const output = await persistProductCopyOutput(task, buildFakeProductCopy(task));
+    this.lastRunMetadata = normalizeTextResultMetadata(
+      {
+        ok: true,
+        provider: this.providerName,
+        model: this.modelName,
+        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        latency_ms: 0,
+        raw_response_json_safe: { provider: this.providerName, model: this.modelName, fake: true, output_type: 'copywriting' },
+      },
+      this.providerName,
+      this.modelName,
+    );
+    return [output];
   }
 
   async copyAllInputs(task) {
