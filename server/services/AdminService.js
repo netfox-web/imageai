@@ -203,6 +203,7 @@ export function getAdminTaskDetail(id) {
   );
   if (!row) return null;
   const images = GenerationTask.images(row.id).map((image) => ({ ...image, url: storageUrl(image.storage_path) }));
+  const isTextAsset = (image) => String(image.mime_type || '').startsWith('text/');
   const logs = GenerationTask.costLogs(row.id).map((log) => ({
     ...log,
     metadata: parseCostLogMeta(log),
@@ -240,7 +241,8 @@ export function getAdminTaskDetail(id) {
       credits_balance: row.user_credits,
     },
     input_images: images.filter((image) => image.type === 'input'),
-    output_images: images.filter((image) => image.type === 'output'),
+    output_images: images.filter((image) => image.type === 'output' && !isTextAsset(image)),
+    text_outputs: images.filter((image) => image.type === 'output' && isTextAsset(image)),
     formats: GenerationTask.formats(row.id),
     ai_cost_logs: logs,
   };

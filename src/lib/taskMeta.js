@@ -30,6 +30,7 @@ export function parseTaskCostMeta(log = null) {
     requestedCapability: raw.requested_capability || '',
     providerSelectionReason: raw.provider_selection_reason || '',
     qualityReviewRequired: Boolean(raw.quality_review_required),
+    outputType: raw.output_type || '',
   };
 }
 
@@ -54,6 +55,7 @@ export function emptyTaskCostMeta() {
     requestedCapability: '',
     providerSelectionReason: '',
     qualityReviewRequired: false,
+    outputType: '',
   };
 }
 

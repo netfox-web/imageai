@@ -33,6 +33,12 @@ export class CreditService {
       return totalOutputs * (bannerRates[imageSize] || bannerRates['2K']);
     }
 
+    if (toolType === 'copywriting') {
+      const provider = payload.provider || config.aiProvider || 'fake';
+      if (provider === 'fake') return Number(config.fakeTaskCost || 0);
+      return 1;
+    }
+
     return (config.aiProvider === 'fake' ? Number(config.fakeTaskCost || 0) : 1) * imageCount;
   }
 

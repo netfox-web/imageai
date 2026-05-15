@@ -10,7 +10,7 @@ import { resolveStoragePath, storageService, storageUrl } from './StorageService
 import { queueService } from './QueueService.js';
 import { resolveProviderSelection } from './ProviderSelectionService.js';
 
-const validTools = new Set(['banner', 'translation', 'cutout', 'removal']);
+const validTools = new Set(['banner', 'translation', 'cutout', 'removal', 'copywriting']);
 const validRoles = new Set(['cover', 'white_bg', 'feature', 'scenario', 'detail', 'comparison', 'multi_use', 'info']);
 
 function parseJsonField(value, fallback = null) {
@@ -32,6 +32,10 @@ function asArray(value) {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function isTextAsset(asset) {
+  return String(asset.mime_type || '').startsWith('text/');
 }
 
 function taskPayloadFromRequest(body, files) {
@@ -71,10 +75,17 @@ function taskPayloadFromRequest(body, files) {
 }
 
 function validateTaskPayload(payload, files) {
-  validateImageFiles(files);
-
   if (!validTools.has(payload.tool_type)) {
     throw validationError('不支援的工具類型');
+  }
+
+  if (payload.tool_type === 'copywriting') {
+    validateImageFiles(files, 0);
+    if (!payload.product_name && !payload.main_title && !payload.subtitle && !payload.custom_prompt && !files.length) {
+      throw validationError('Product copywriting needs product details or at least one image.');
+    }
+  } else {
+    validateImageFiles(files);
   }
 
   if (payload.tool_type === 'banner') {
@@ -98,6 +109,15 @@ function validateTaskPayload(payload, files) {
       throw validationError('自訂尺寸需介於 100 到 4096');
     }
   });
+}
+
+function normalizeTaskPayload(payload) {
+  if (payload.tool_type !== 'banner') {
+    payload.platform_format_ids = [];
+    payload.custom_formats = [];
+    payload.quantity = 1;
+  }
+  return payload;
 }
 
 async function writeInputFile(file, taskId, index) {
@@ -127,7 +147,7 @@ export class TaskService {
       throw validationError('帳號已停權，無法建立任務', 403);
     }
 
-    const payload = taskPayloadFromRequest(body, files || []);
+    const payload = normalizeTaskPayload(taskPayloadFromRequest(body, files || []));
     validateTaskPayload(payload, files || []);
     if (Number(user.credits_balance || 0) < Number(config.minCreditsToCreateTask || 0)) {
       throw validationError(`點數不足，至少需要 ${config.minCreditsToCreateTask} 點才能建立任務。`, 422);
@@ -246,7 +266,8 @@ export class TaskService {
       ...task,
       images,
       input_images: images.filter((image) => image.type === 'input'),
-      output_images: images.filter((image) => image.type === 'output'),
+      output_images: images.filter((image) => image.type === 'output' && !isTextAsset(image)),
+      text_outputs: images.filter((image) => image.type === 'output' && isTextAsset(image)),
       formats: GenerationTask.formats(task.id),
       ai_cost_logs: GenerationTask.costLogs(task.id),
       quality_reviews: all('SELECT * FROM quality_reviews WHERE task_id = ? ORDER BY id DESC', [Number(task.id)]),

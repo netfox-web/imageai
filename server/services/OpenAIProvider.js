@@ -7,6 +7,12 @@ import { FakeAIProvider } from './FakeAIProvider.js';
 import { AIProviderInterface } from './AIProviderInterface.js';
 import { buildBannerPrompt as buildBannerPromptText } from './BannerPromptBuilder.js';
 import { postProcessImage } from './ImagePostProcessor.js';
+import {
+  buildProductCopyPrompt,
+  normalizeTextResultMetadata,
+  persistProductCopyOutput,
+  throwIfTextResultFailed,
+} from './CopywritingService.js';
 
 const defaultImageRoles = ['cover', 'scenario', 'detail', 'feature', 'multi_use'];
 const supportedImageSizes = ['1024x1024', '1024x1536', '1536x1024'];
@@ -426,6 +432,20 @@ export class OpenAIProvider extends AIProviderInterface {
 
   async removeText(task) {
     return this.fallbackProvider.removeText(task);
+  }
+
+  async generateProductCopy(task) {
+    return this.withFallback('generateProductCopy', [task], async () => {
+      const freshTask = GenerationTask.find(task.id) || task;
+      const result = await this.generateText({
+        prompt: buildProductCopyPrompt(freshTask),
+        model: freshTask.resolved_model || config.openaiTextModel,
+      });
+      throwIfTextResultFailed(result, 'OpenAI product copywriting failed.');
+      const output = await persistProductCopyOutput(freshTask, result.output);
+      this.lastRunMetadata = normalizeTextResultMetadata(result, this.providerName, config.openaiTextModel);
+      return [output];
+    });
   }
 
   async responsesCreate(payload) {

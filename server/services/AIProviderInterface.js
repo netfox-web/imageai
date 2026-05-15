@@ -15,6 +15,10 @@ export class AIProviderInterface {
     throw new Error('removeText must be implemented.');
   }
 
+  generateProductCopy() {
+    throw new Error('generateProductCopy must be implemented.');
+  }
+
   analyzeProductImages() {
     throw new Error('analyzeProductImages must be implemented.');
   }

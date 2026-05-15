@@ -69,11 +69,14 @@ export class GenerateTaskJob {
         outputs = await provider.cutoutImage(freshTask);
       } else if (freshTask.tool_type === 'removal') {
         outputs = await provider.removeText(freshTask);
+      } else if (freshTask.tool_type === 'copywriting') {
+        outputs = await provider.generateProductCopy(freshTask);
       } else {
         throw new Error(`Unsupported tool_type: ${freshTask.tool_type}`);
       }
 
       const runMetadata = provider.consumeLastRunMetadata?.() || {};
+      const loggedImageCount = Number.isFinite(Number(runMetadata.image_count)) ? Number(runMetadata.image_count) : outputs.length;
       const latencyMs = Number(runMetadata.latency_ms || Date.now() - jobStartedAt);
       const selectionFallback = Boolean(freshTask.fallback_reason && freshTask.resolved_provider === 'fake' && freshTask.requested_provider && freshTask.requested_provider !== 'fake');
       const fallbackUsed = Boolean(runMetadata.fallback_from || runMetadata.fallback_used || selectionFallback);
@@ -99,13 +102,14 @@ export class GenerateTaskJob {
         model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
         input_tokens: runMetadata.usage?.input_tokens || runMetadata.usage?.prompt_tokens || null,
         output_tokens: runMetadata.usage?.output_tokens || runMetadata.usage?.completion_tokens || null,
-        image_count: outputs.length,
+        image_count: loggedImageCount,
         cost_usd: runMetadata.cost_usd ?? (runMetadata.provider === 'fake' || provider.providerName === 'fake' ? 0 : null),
         raw_response_json: JSON.stringify({
           outputCount: outputs.length,
           provider: runMetadata.provider || provider.providerName || 'unknown',
           model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
-          image_count: outputs.length,
+          image_count: loggedImageCount,
+          output_type: runMetadata.output_type || (freshTask.tool_type === 'copywriting' ? 'copywriting' : 'image'),
           usage: runMetadata.usage || null,
           estimated_cost: runMetadata.estimated_cost ?? runMetadata.cost_usd ?? null,
           cost: runMetadata.cost_usd ?? null,

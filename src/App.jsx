@@ -41,6 +41,7 @@ const toolLabels = {
   translation: '圖片翻譯',
   cutout: '智慧去背',
   removal: '智慧去字',
+  copywriting: 'Product copywriting',
 };
 
 const statusLabels = {
@@ -400,6 +401,10 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
   const creditCost =
     toolType === 'banner'
       ? files.length * selectedFormatCount * quantity * (imageSize === '4K' ? 30 : 15)
+      : toolType === 'copywriting'
+        ? advanced.provider && advanced.provider !== 'fake'
+          ? 1
+          : 0
       : files.length;
 
   const addFiles = (incoming) => {
@@ -480,7 +485,7 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
       data.append('quantity', String(quantity));
       data.append('provider', advanced.provider || '');
       data.append('model', advanced.model || '');
-      data.append('capability', advanced.capability || 'generate');
+      data.append('capability', toolType === 'copywriting' ? 'copywriting' : advanced.capability || 'generate');
       data.append('strict_provider', advanced.strict_provider ? 'true' : 'false');
       data.append('quality_review_required', advanced.quality_review_required ? 'true' : 'false');
       data.append('input_roles', JSON.stringify(files.map((item) => item.role)));
@@ -554,7 +559,7 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
                 }`}
               >
                 <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-neutral-950 text-white">
-                  {tool.key === 'banner' ? <Sparkles className="h-4 w-4" /> : <ImageIcon className="h-4 w-4" />}
+                  {tool.key === 'banner' ? <Sparkles className="h-4 w-4" /> : tool.key === 'copywriting' ? <Copy className="h-4 w-4" /> : <ImageIcon className="h-4 w-4" />}
                 </div>
                 <div className="text-sm font-black">{tool.name}</div>
                 <div className="mt-1 line-clamp-2 text-xs text-neutral-500">{tool.description}</div>
@@ -613,6 +618,11 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
                 customFormats={customFormats}
                 setCustomFormats={setCustomFormats}
               />
+            </>
+          ) : toolType === 'copywriting' ? (
+            <>
+              <CopyForm form={form} setForm={setForm} analyze={analyze} loadingAnalyze={loadingAnalyze} clearAll={clearAll} analysisMeta={analysisMeta} />
+              <CopywritingToolPanel language={language} setLanguage={setLanguage} />
             </>
           ) : (
             <SimpleToolPanel toolType={toolType} targetLanguage={targetLanguage} setTargetLanguage={setTargetLanguage} />
@@ -1101,6 +1111,23 @@ function SimpleToolPanel({ toolType, targetLanguage, setTargetLanguage }) {
   );
 }
 
+function CopywritingToolPanel({ language, setLanguage }) {
+  return (
+    <section className="panel">
+      <h2 className="text-lg font-black">Product copywriting</h2>
+      <div className="mt-3 max-w-xs">
+        <label className="label">Output language</label>
+        <select className="field" value={language} onChange={(e) => setLanguage(e.target.value)}>
+          <option value="zh-TW">繁體中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+        </select>
+      </div>
+    </section>
+  );
+}
+
 function DashboardShell({ route, navigate, children }) {
   const links = [
     ['/dashboard', '儀表板', LayoutDashboard],
@@ -1378,6 +1405,7 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
                 <button className="btn btn-ghost gap-2" onClick={requestHandoff}><Shield className="h-4 w-4" />Request DevPilot handoff</button>
                 <button className="btn btn-ghost gap-2" onClick={() => navigate(`/feedback?task_id=${task.id}`)}><AlertTriangle className="h-4 w-4" />Report issue</button>
               </div>
+              <TextOutputGrid outputs={task.text_outputs || []} />
               <ImageGrid
                 images={task.output_images}
                 onRegenerate={regenerateOutput}
@@ -1390,6 +1418,44 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
         </section>
       </div>
     </main>
+  );
+}
+
+function TextOutputGrid({ outputs }) {
+  const [texts, setTexts] = useState({});
+  useEffect(() => {
+    (outputs || []).forEach((output) => {
+      if (!output?.url || texts[output.id]) return;
+      fetch(output.url, { credentials: 'include' })
+        .then((response) => (response.ok ? response.text() : ''))
+        .then((text) => setTexts((current) => ({ ...current, [output.id]: text })))
+        .catch(() => setTexts((current) => ({ ...current, [output.id]: 'Unable to load copy output.' })));
+    });
+  }, [outputs?.map((output) => output.id).join(',')]);
+  if (!outputs?.length) return null;
+  return (
+    <div className="panel mb-4">
+      <h2 className="mb-3 text-lg font-black">Copy output</h2>
+      <div className="space-y-3">
+        {outputs.map((output) => (
+          <div key={output.id} className="rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+            <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-white p-3 text-sm leading-6 text-neutral-800">
+              {texts[output.id] || 'Loading copy...'}
+            </pre>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <a href={output.url} download className="btn btn-ghost gap-2">
+                <Download className="h-4 w-4" />
+                Download TXT
+              </a>
+              <button className="btn btn-ghost gap-2" onClick={() => navigator.clipboard?.writeText(texts[output.id] || '')}>
+                <Copy className="h-4 w-4" />
+                Copy text
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1616,6 +1682,7 @@ function AssetsManagerPage(props) {
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {assets.map((asset) => {
               const draft = drafts[asset.id] || { tags: (asset.tags || []).join(', '), notes: asset.notes || '' };
+              const textAsset = String(asset.mime_type || '').startsWith('text/');
               return (
                 <div key={asset.id} className="rounded-xl border border-neutral-200 bg-white p-3">
                   <label className="mb-2 flex items-center gap-2 text-xs font-bold text-neutral-500">
@@ -1623,7 +1690,14 @@ function AssetsManagerPage(props) {
                     #{asset.id} / task #{asset.task_id}
                   </label>
                   <div className="aspect-square overflow-hidden rounded-lg bg-neutral-100">
-                    <img src={asset.url} className="h-full w-full object-cover" alt="" onError={(event) => { event.currentTarget.replaceWith(document.createTextNode(imageLoadErrorMessage())); }} />
+                    {textAsset ? (
+                      <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-4 text-center text-sm font-black text-neutral-700">
+                        <Copy className="h-8 w-8" />
+                        <span>Copywriting TXT</span>
+                      </div>
+                    ) : (
+                      <img src={asset.url} className="h-full w-full object-cover" alt="" onError={(event) => { event.currentTarget.replaceWith(document.createTextNode(imageLoadErrorMessage())); }} />
+                    )}
                   </div>
                   <div className="mt-3 space-y-1 text-xs text-neutral-600">
                     <div className="font-black text-neutral-900">{asset.product_name || asset.main_title || 'Untitled'}</div>
@@ -2109,11 +2183,13 @@ function AdminTaskDetailPage(props) {
       <PageTitle title={`Admin Task #${detail.task.id}`} subtitle="Provider metadata, storage URLs, and safe raw response summary." />
       <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
         <section className="space-y-4">
+          <TextOutputGrid outputs={detail.text_outputs || []} />
           <div className="panel">
             <ImageGrid images={detail.output_images} title="Output preview" />
             <div className="mt-3 space-y-1 text-xs">
               {detail.output_images?.map((image) => <div key={image.id} className="break-all">{image.url}</div>)}
-              {!detail.output_images?.length && <div className="text-neutral-500">No output images yet.</div>}
+              {detail.text_outputs?.map((output) => <div key={output.id} className="break-all">{output.url}</div>)}
+              {!detail.output_images?.length && !detail.text_outputs?.length && <div className="text-neutral-500">No output images yet.</div>}
             </div>
           </div>
           <div className="panel">

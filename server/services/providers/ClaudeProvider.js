@@ -3,6 +3,12 @@ import { fallbackPrompts, renderPromptByKey } from '../PromptRenderer.js';
 import { FakeAIProvider } from '../FakeAIProvider.js';
 import { AIProviderInterface } from '../AIProviderInterface.js';
 import { parseJsonFromText } from '../OpenAIProvider.js';
+import {
+  buildProductCopyPrompt,
+  normalizeTextResultMetadata,
+  persistProductCopyOutput,
+  throwIfTextResultFailed,
+} from '../CopywritingService.js';
 
 const defaultImageRoles = ['cover', 'scenario', 'detail', 'feature', 'multi_use'];
 
@@ -146,6 +152,19 @@ export class ClaudeProvider extends AIProviderInterface {
     return this.fallbackProvider.removeText(task);
   }
 
+  async generateProductCopy(task) {
+    return this.withFallback('generateProductCopy', [task], async () => {
+      const result = await this.generateText({
+        prompt: buildProductCopyPrompt(task),
+        model: task.resolved_model || config.claudeModel,
+      });
+      throwIfTextResultFailed(result, 'Claude product copywriting failed.');
+      const output = await persistProductCopyOutput(task, result.output);
+      this.lastRunMetadata = normalizeTextResultMetadata(result, this.providerName, config.claudeModel);
+      return [output];
+    });
+  }
+
   async createMessage(body) {
     const baseUrl = String(config.claudeBaseUrl || 'https://api.anthropic.com').replace(/\/+$/, '');
     const response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
@@ -234,6 +253,17 @@ export class ClaudeProvider extends AIProviderInterface {
     } catch (error) {
       if (config.aiStrictProvider) throw error;
       const result = await this.fallbackProvider[method](...args);
+      const fallbackMetadata = this.fallbackProvider.consumeLastRunMetadata?.() || {};
+      this.lastRunMetadata = {
+        ...fallbackMetadata,
+        provider: 'fake',
+        model: 'fake',
+        fallback_from: this.providerName,
+        fallback_used: true,
+        fallback_reason: error.message,
+        error: error.message,
+        error_code: error.code || error.name || 'provider_error',
+      };
       if (result && typeof result === 'object' && !Array.isArray(result)) {
         result._meta = {
           ...(result._meta || {}),

@@ -36,6 +36,7 @@ function seedTools() {
     ['translation', '圖片翻譯', '保留版面並翻譯圖片文案。'],
     ['cutout', '智慧去背', '快速去除商品背景。'],
     ['removal', '智慧去字', '移除圖片上的既有文字。'],
+    ['copywriting', 'Product copywriting', 'Generate product titles, descriptions, selling points, CTAs, keywords, and hashtags.'],
   ].forEach(([key, name, description], index) => {
     upsert('tools', 'key', {
       key,
@@ -222,6 +223,15 @@ function seedPromptTemplates() {
       system_prompt: 'You analyze product photos and produce Taiwanese ecommerce copy.',
       user_prompt_template: 'Analyze uploaded product images and infer product name, title, subtitle, prompt, and image roles.',
       notes: 'Used by /studio/analyze.',
+    },
+    {
+      key: 'product_copywriting',
+      name: 'Product copywriting',
+      tool_type: 'copywriting',
+      system_prompt: 'You write concise ecommerce product copy for product pages, ads, and social posts.',
+      user_prompt_template:
+        'Write ecommerce product copy for {{product_name}} in {{language}}. Main title: {{main_title}}. Subtitle: {{subtitle}}. Notes: {{custom_prompt}}.',
+      notes: 'Used by copywriting MVP tasks.',
     },
   ].forEach((template) => {
     upsert('prompt_templates', 'key', {

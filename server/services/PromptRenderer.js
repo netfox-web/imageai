@@ -16,6 +16,8 @@ export const fallbackPrompts = {
     'Analyze the uploaded ecommerce product images. Return JSON with productName, title, subtitle, customPrompt, and imageRoles.',
   banner_generation:
     'Create ecommerce advertising banner creatives for {{product_name}}. Main title: {{main_title}}. Subtitle: {{subtitle}}. Style: {{style_name}}. Language: {{language}}. Size: {{image_size}}. Formats: {{formats}}. Extra direction: {{custom_prompt}}.',
+  product_copywriting:
+    'Write ecommerce product copy for {{product_name}} in {{language}}. Main title: {{main_title}}. Subtitle: {{subtitle}}. Brand/product notes: {{custom_prompt}}.',
 };
 
 export function renderTemplateString(template, variables = {}) {

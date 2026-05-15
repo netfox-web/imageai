@@ -4,6 +4,11 @@ import { fallbackPrompts, renderPromptByKey, taskPromptVariables } from './Promp
 import { storageService } from './StorageService.js';
 import { FakeAIProvider } from './FakeAIProvider.js';
 import { AIProviderInterface } from './AIProviderInterface.js';
+import {
+  buildProductCopyPrompt,
+  normalizeTextResultMetadata,
+  persistProductCopyOutput,
+} from './CopywritingService.js';
 
 export class ExternalAIProvider extends AIProviderInterface {
   providerName = 'external';
@@ -12,6 +17,7 @@ export class ExternalAIProvider extends AIProviderInterface {
   constructor(fallbackProvider = new FakeAIProvider()) {
     super();
     this.fallbackProvider = fallbackProvider;
+    this.lastRunMetadata = null;
   }
 
   async analyzeProductImages(files, language = 'zh-TW') {
@@ -85,6 +91,30 @@ export class ExternalAIProvider extends AIProviderInterface {
     return this.fallbackProvider.removeText(task);
   }
 
+  async generateProductCopy(task) {
+    return this.withFallback('generateProductCopy', [task], async () => {
+      const response = await this.request('/copywriting', {
+        task,
+        prompt: buildProductCopyPrompt(task),
+      });
+      const text = response.output || response.text || response.copy || '';
+      if (!text) throw new Error('External provider did not return copywriting output.');
+      const output = await persistProductCopyOutput(task, text);
+      this.lastRunMetadata = normalizeTextResultMetadata(
+        {
+          ok: true,
+          provider: this.providerName,
+          model: response.model || this.modelName,
+          usage: response.usage || null,
+          raw_response_json_safe: { output_type: 'copywriting', external: true },
+        },
+        this.providerName,
+        this.modelName,
+      );
+      return [output];
+    });
+  }
+
   async request(endpoint, body) {
     if (!config.externalAiBaseUrl) {
       throw new Error('EXTERNAL_AI_BASE_URL is not configured.');
@@ -111,7 +141,25 @@ export class ExternalAIProvider extends AIProviderInterface {
       return await callback();
     } catch (error) {
       if (config.aiStrictProvider) throw error;
-      return this.fallbackProvider[method](...args);
+      const result = await this.fallbackProvider[method](...args);
+      const fallbackMetadata = this.fallbackProvider.consumeLastRunMetadata?.() || {};
+      this.lastRunMetadata = {
+        ...fallbackMetadata,
+        provider: 'fake',
+        model: 'fake',
+        fallback_from: this.providerName,
+        fallback_used: true,
+        fallback_reason: error.message,
+        error: error.message,
+        error_code: error.code || error.name || 'provider_error',
+      };
+      return result;
     }
+  }
+
+  consumeLastRunMetadata() {
+    const metadata = this.lastRunMetadata;
+    this.lastRunMetadata = null;
+    return metadata;
   }
 }
