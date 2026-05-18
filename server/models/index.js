@@ -125,6 +125,13 @@ export class GenerationTask {
   static costLogs(id) {
     return all('SELECT * FROM ai_cost_logs WHERE task_id = ? ORDER BY id DESC', [Number(id)]);
   }
+
+  static artifacts(id) {
+    return all(
+      'SELECT * FROM task_artifacts WHERE task_id = ? AND deleted_at IS NULL ORDER BY id ASC',
+      [Number(id)],
+    );
+  }
 }
 
 export class TaskImage {
@@ -155,6 +162,12 @@ export class TaskImage {
 export class TaskFormat {
   static create(attributes) {
     return insertRow('task_formats', attributes);
+  }
+}
+
+export class TaskArtifact {
+  static create(attributes) {
+    return insertRow('task_artifacts', attributes);
   }
 }
 

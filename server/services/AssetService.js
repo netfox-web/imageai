@@ -101,7 +101,36 @@ export function listAssets({ user, query = {}, admin = false } = {}) {
     [...params, limit, offset],
   ).map(serializeAsset);
   const total = Number(get(`SELECT COUNT(*) AS count FROM (SELECT task_images.id ${from} GROUP BY task_images.id)`, params)?.count || 0);
-  return { assets: rows, total, limit, offset };
+  return { assets: rows, artifacts: listAssetArtifacts({ user, query, admin }), total, limit, offset };
+}
+
+function listAssetArtifacts({ user, query = {}, admin = false } = {}) {
+  if (query.type && !['all', 'output', 'artifact'].includes(query.type)) return [];
+  const where = ['task_artifacts.deleted_at IS NULL'];
+  const params = [];
+  if (!admin) {
+    where.push('generation_tasks.user_id = ?');
+    params.push(Number(user.id));
+  }
+  if (query.q) {
+    where.push('(CAST(generation_tasks.id AS TEXT) = ? OR generation_tasks.product_name LIKE ? OR generation_tasks.main_title LIKE ? OR task_artifacts.title LIKE ? OR task_artifacts.content_text LIKE ?)');
+    params.push(String(query.q), `%${query.q}%`, `%${query.q}%`, `%${query.q}%`, `%${query.q}%`);
+  }
+  const rows = all(
+    `SELECT task_artifacts.*, generation_tasks.user_id, generation_tasks.product_name, generation_tasks.main_title,
+            generation_tasks.tool_type, generation_tasks.status AS task_status
+     FROM task_artifacts
+     INNER JOIN generation_tasks ON generation_tasks.id = task_artifacts.task_id
+     WHERE ${where.join(' AND ')}
+     ORDER BY task_artifacts.id DESC
+     LIMIT 50`,
+    params,
+  );
+  return rows.map((artifact) => ({
+    ...artifact,
+    url: artifact.storage_path ? storageUrl(artifact.storage_path) : null,
+    metadata: safeJson(artifact.metadata_json),
+  }));
 }
 
 export function batchUpdateAssets({ user, ids = [], body = {}, admin = false, req = null } = {}) {
@@ -355,6 +384,14 @@ function safeTags(tags) {
     return JSON.parse(tags || '[]');
   } catch {
     return [];
+  }
+}
+
+function safeJson(value) {
+  try {
+    return JSON.parse(value || '{}');
+  } catch {
+    return {};
   }
 }
 

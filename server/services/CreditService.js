@@ -7,6 +7,17 @@ const bannerRates = {
   '4K': 30,
 };
 
+const toolBaseRates = {
+  post_generator: 2,
+  image_mix: 12,
+  image_to_video: 40,
+  voice_clone: 50,
+  lip_sync: 50,
+  face_swap: 50,
+  avatar: 50,
+  avatar_video: 50,
+};
+
 export class CreditService {
   calculateTaskCost(payload) {
     const toolType = payload.tool_type || payload.toolType;
@@ -31,6 +42,13 @@ export class CreditService {
       if (provider === 'gemini') return totalOutputs * Number(config.geminiTaskEstimatedCostCredits || 0);
       if (provider === 'claude') return totalOutputs * Number(config.claudeTaskEstimatedCostCredits || 0);
       return totalOutputs * (bannerRates[imageSize] || bannerRates['2K']);
+    }
+
+    if (toolBaseRates[toolType]) {
+      const provider = payload.provider || config.aiProvider || 'fake';
+      if (provider === 'fake') return Number(config.fakeTaskCost || 0);
+      const unitCount = Math.max(1, imageCount || 1);
+      return toolBaseRates[toolType] * unitCount;
     }
 
     return (config.aiProvider === 'fake' ? Number(config.fakeTaskCost || 0) : 1) * imageCount;

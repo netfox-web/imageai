@@ -22,11 +22,13 @@ function upsert(table, uniqueColumns, values) {
 
 export async function seed() {
   seedTools();
+  seedAdaiTools();
   seedStylePresets();
   seedTextStyles();
   seedPlatformFormats();
   seedCreditPackages();
   seedPromptTemplates();
+  seedAdaiPromptTemplates();
   await seedDemoAdmin();
 }
 
@@ -43,6 +45,27 @@ function seedTools() {
       description,
       is_active: 1,
       sort_order: index + 1,
+    });
+  });
+}
+
+function seedAdaiTools() {
+  [
+    ['post_generator', '貼文生成器', '依 Brand DNA 產出社群貼文、CTA 與 hashtag。'],
+    ['image_mix', '圖片混合', '混合多張參考圖，建立新的視覺方向。'],
+    ['image_to_video', '圖生影片', '把圖片轉成短影片任務與媒體作品。'],
+    ['voice_clone', '聲音克隆', '需同意與稽核，結果預設私密。'],
+    ['lip_sync', '對嘴影片', '需同意與稽核，結果預設私密。'],
+    ['face_swap', '換臉', '需同意與稽核，結果預設私密。'],
+    ['avatar', 'Avatar', '需同意與稽核，結果預設私密。'],
+    ['avatar_video', 'Avatar 影片', '穩定的 Avatar 影片工作流，需同意與稽核。'],
+  ].forEach(([key, name, description], index) => {
+    upsert('tools', 'key', {
+      key,
+      name,
+      description,
+      is_active: 1,
+      sort_order: 20 + index,
     });
   });
 }
@@ -222,6 +245,37 @@ function seedPromptTemplates() {
       system_prompt: 'You analyze product photos and produce Taiwanese ecommerce copy.',
       user_prompt_template: 'Analyze uploaded product images and infer product name, title, subtitle, prompt, and image roles.',
       notes: 'Used by /studio/analyze.',
+    },
+  ].forEach((template) => {
+    upsert('prompt_templates', 'key', {
+      ...template,
+      version: 1,
+      is_active: 1,
+    });
+  });
+}
+
+function seedAdaiPromptTemplates() {
+  [
+    {
+      key: 'post_generation',
+      name: '貼文生成器',
+      tool_type: 'post_generator',
+      system_prompt: 'You are an ecommerce social media strategist.',
+      user_prompt_template:
+        'Generate a social post for {{product_name}} using Brand DNA, campaign goal, channel, tone, CTA, and hashtag guidance.',
+      capability: 'post_generation',
+      notes: 'Used by post_generator tasks; fake provider returns deterministic copy.',
+    },
+    {
+      key: 'image_to_video',
+      name: '圖生影片',
+      tool_type: 'image_to_video',
+      system_prompt: 'You create short ecommerce video briefs from product images.',
+      user_prompt_template:
+        'Create a short video job plan for {{product_name}} with duration, motion, scene notes, and safety constraints.',
+      capability: 'image_to_video',
+      notes: 'External video providers can consume task metadata and return private artifacts.',
     },
   ].forEach((template) => {
     upsert('prompt_templates', 'key', {

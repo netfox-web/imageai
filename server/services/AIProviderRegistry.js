@@ -8,6 +8,8 @@ import { DevPilotGatewayProvider } from './providers/DevPilotGatewayProvider.js'
 
 const baseCapabilities = ['summary', 'classification', 'rewrite', 'extraction', 'planning', 'chat', 'generate'];
 const imageCapabilities = ['image_generation', 'image_editing', 'image_variation', 'prompt_rewrite'];
+const mediaCapabilities = ['post_generation', 'image_mix', 'sensitive_media'];
+const videoCapabilities = ['image_to_video', 'video_generation'];
 
 function hasValue(value) {
   return Boolean(String(value || '').trim());
@@ -22,6 +24,7 @@ function meta({
   capabilities = [],
   supportsImageGeneration = false,
   supportsImageEditing = false,
+  supportsImageToVideo = false,
   supportsTextGeneration = true,
   keyConfigured = false,
   source = 'env',
@@ -36,6 +39,7 @@ function meta({
     capabilities,
     supportsImageGeneration,
     supportsImageEditing,
+    supportsImageToVideo,
     supportsTextGeneration,
     keyConfigured,
     source,
@@ -50,9 +54,10 @@ function definitions(currentConfig = config) {
       label: 'Fake Provider',
       configured: true,
       models: ['fake'],
-      capabilities: [...baseCapabilities, ...imageCapabilities],
+      capabilities: [...baseCapabilities, ...imageCapabilities, ...mediaCapabilities, ...videoCapabilities],
       supportsImageGeneration: true,
       supportsImageEditing: true,
+      supportsImageToVideo: true,
       keyConfigured: true,
       source: 'built-in',
       factory: () => new FakeAIProvider(),
@@ -63,7 +68,7 @@ function definitions(currentConfig = config) {
       configured: hasValue(currentConfig.openaiApiKey),
       keyConfigured: hasValue(currentConfig.openaiApiKey),
       models: [currentConfig.openaiTextModel, currentConfig.openaiImageModel].filter(Boolean),
-      capabilities: [...baseCapabilities, ...imageCapabilities],
+      capabilities: [...baseCapabilities, ...imageCapabilities, ...mediaCapabilities],
       supportsImageGeneration: true,
       supportsImageEditing: true,
       source: 'env',
@@ -75,7 +80,7 @@ function definitions(currentConfig = config) {
       configured: hasValue(currentConfig.geminiApiKey),
       keyConfigured: hasValue(currentConfig.geminiApiKey),
       models: [currentConfig.geminiModel || 'gemini-1.5-flash'],
-      capabilities: [...baseCapabilities, ...imageCapabilities],
+      capabilities: [...baseCapabilities, ...imageCapabilities, ...mediaCapabilities],
       supportsImageGeneration: true,
       supportsImageEditing: true,
       source: 'env',
@@ -87,7 +92,7 @@ function definitions(currentConfig = config) {
       configured: hasValue(currentConfig.claudeApiKey),
       keyConfigured: hasValue(currentConfig.claudeApiKey),
       models: [currentConfig.claudeModel].filter(Boolean),
-      capabilities: [...baseCapabilities, 'prompt_rewrite'],
+      capabilities: [...baseCapabilities, 'prompt_rewrite', 'post_generation'],
       supportsImageGeneration: false,
       supportsImageEditing: false,
       source: 'env',
@@ -99,9 +104,10 @@ function definitions(currentConfig = config) {
       configured: hasValue(currentConfig.externalAiBaseUrl),
       keyConfigured: hasValue(currentConfig.externalAiApiKey),
       models: ['external'],
-      capabilities: [...baseCapabilities, ...imageCapabilities],
+      capabilities: [...baseCapabilities, ...imageCapabilities, ...mediaCapabilities, ...videoCapabilities],
       supportsImageGeneration: true,
       supportsImageEditing: true,
+      supportsImageToVideo: true,
       source: 'env',
       factory: () => new ExternalAIProvider(),
     }),
@@ -111,9 +117,10 @@ function definitions(currentConfig = config) {
       configured: hasValue(currentConfig.devpilotGatewayBaseUrl),
       keyConfigured: hasValue(currentConfig.devpilotGatewayApiKey),
       models: [currentConfig.devpilotGatewayModel || 'devpilot-gateway'],
-      capabilities: [...baseCapabilities, ...imageCapabilities],
+      capabilities: [...baseCapabilities, ...imageCapabilities, ...mediaCapabilities, ...videoCapabilities],
       supportsImageGeneration: true,
       supportsImageEditing: true,
+      supportsImageToVideo: true,
       source: 'env-or-admin-gateway',
       factory: () => new DevPilotGatewayProvider(),
     }),

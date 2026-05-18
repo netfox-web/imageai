@@ -37,7 +37,7 @@ import { formatStorageCheck, runStorageCheck } from '../server/services/StorageD
 import { runEnvDiagnostics } from '../server/services/EnvDiagnostics.js';
 import { adminStorageSummary, getAdminTaskDetail, safeRawResponse } from '../server/services/AdminService.js';
 import { runQualityReview } from '../server/services/QualityReview.js';
-import { classifyTaskError } from '../server/services/TaskFailurePolicy.js';
+import { classifyTaskError, recordTaskFailure } from '../server/services/TaskFailurePolicy.js';
 import { recoverStuckTasks } from '../server/services/TaskRecoveryService.js';
 import { runLocalCleanup } from '../server/services/CleanupService.js';
 import { runDevReset } from '../server/services/DevResetService.js';
@@ -51,7 +51,12 @@ import { readAiPingLastReport, runAiPing } from '../server/services/AiPingDiagno
 import { formatDomainCheck, runDomainCheck } from '../server/services/DomainDiagnostics.js';
 import { runTrialCheck } from '../server/services/TrialDiagnostics.js';
 import { assertSafeTrialPath, runTrialCleanup } from '../server/services/TrialCleanupService.js';
-import { imageLoadErrorMessage, parseTaskCostMeta } from '../src/lib/taskMeta.js';
+import { friendlyTaskError, imageLoadErrorMessage, parseTaskCostMeta, shortTaskError } from '../src/lib/taskMeta.js';
+import { formatRcSmokeChecklist, runRcSmokeChecklist } from '../server/services/RcSmokeChecklist.js';
+import { buildProviderCapabilityMatrix } from '../server/services/ProviderCapabilityMatrix.js';
+import { buildMockImageToVideoResponse } from '../server/services/MockExternalProvider.js';
+import { runExternalVideoSmoke } from '../server/services/ExternalVideoSmoke.js';
+import { formatReleaseReadiness, runReleaseReadiness } from '../server/services/ReleaseReadiness.js';
 
 const png = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p94AAAAASUVORK5CYII=',
@@ -111,6 +116,24 @@ async function createBannerTask(agent, token, overrides = {}) {
   return req.attach('images', png, { filename: 'product.png', contentType: 'image/png' });
 }
 
+async function createImageToVideoTask(agent, token, overrides = {}) {
+  let req = agent
+    .post('/studio/tasks')
+    .set('x-csrf-token', token)
+    .field('tool_type', 'image_to_video')
+    .field('product_name', overrides.product_name || 'Video Product')
+    .field('main_title', overrides.main_title || 'Turn this into motion')
+    .field('custom_prompt', overrides.custom_prompt || 'Create a short product video.')
+    .field('metadata_json', JSON.stringify(overrides.metadata || { duration_seconds: 5, motion: 'slow product orbit' }));
+
+  if ('provider' in overrides) req = req.field('provider', overrides.provider);
+  if ('model' in overrides) req = req.field('model', overrides.model);
+  if ('capability' in overrides) req = req.field('capability', overrides.capability);
+  if ('strict_provider' in overrides) req = req.field('strict_provider', String(overrides.strict_provider));
+
+  return req.attach('images', overrides.image || png, { filename: 'product.png', contentType: 'image/png' });
+}
+
 async function waitFor(predicate, timeout = 800) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
@@ -129,6 +152,21 @@ async function makeImage(width = 1024, height = 1024, color = '#facc15') {
       background: color,
     },
   })
+    .png()
+    .toBuffer();
+}
+
+async function makeTransparentCutoutImage(width = 256, height = 256) {
+  const subject = await makeImage(Math.floor(width / 2), Math.floor(height / 2), '#22c55e');
+  return sharp({
+    create: {
+      width,
+      height,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([{ input: subject, left: Math.floor(width / 4), top: Math.floor(height / 4) }])
     .png()
     .toBuffer();
 }
@@ -272,6 +310,317 @@ describe('AI commerce generator MVP', () => {
     expect(response.body.credits_cost).toBe(config.fakeTaskCost);
     expect(get('SELECT credits_cost FROM generation_tasks WHERE id = ?', [response.body.task_id]).credits_cost).toBe(config.fakeTaskCost);
     expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(config.freeCreditsOnSignup);
+  });
+
+  it('post generator runs through task artifacts and credit ledger', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'post-generator@example.com');
+    const response = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'post_generator')
+      .field('product_name', 'Serum')
+      .field('main_title', 'Glow in one step')
+      .field('subtitle', 'Lightweight daily care')
+      .field('custom_prompt', 'Make it concise.')
+      .field('metadata_json', JSON.stringify({ channel: 'instagram', tone: 'premium' }));
+
+    expect(response.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [response.body.task_id])?.status === 'success');
+    const artifact = get('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+    expect(artifact.kind).toBe('text');
+    expect(artifact.visibility).toBe('private');
+    expect(artifact.content_text).toContain('Serum');
+    expect(get('SELECT requested_capability FROM generation_tasks WHERE id = ?', [response.body.task_id]).requested_capability).toBe(
+      'post_generation',
+    );
+    const tx = get('SELECT * FROM credit_transactions WHERE related_task_id = ? AND type = ?', [response.body.task_id, 'consume']);
+    expect(tx).toBeTruthy();
+  });
+
+  it('image_to_video can create a fake placeholder only when fake is explicitly selected', async () => {
+    const previousDriver = config.queueDriver;
+    const previousProvider = config.aiProvider;
+    config.queueDriver = 'worker';
+    config.aiProvider = 'fake';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'image-video-fake@example.com');
+    const response = await createImageToVideoTask(agent, token, { provider: 'fake', capability: 'image_to_video' });
+    expect(response.status).toBe(201);
+
+    await GenerateTaskJob.handle(response.body.task_id);
+    const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+    const artifact = get('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+    const artifactMeta = JSON.parse(artifact.metadata_json);
+
+    expect(task.status).toBe('success');
+    expect(task.requested_provider).toBe('fake');
+    expect(task.resolved_provider).toBe('fake');
+    expect(artifact.kind).toBe('video');
+    expect(artifact.content_text).toContain('Fake provider video placeholder');
+    expect(artifactMeta.fake).toBe(true);
+    config.queueDriver = previousDriver;
+    config.aiProvider = previousProvider;
+  });
+
+  it('image_to_video with OpenAI image model fails and refunds instead of writing a fake placeholder', async () => {
+    const previousDriver = config.queueDriver;
+    const previousProvider = config.aiProvider;
+    const previousKey = config.openaiApiKey;
+    const previousRefund = config.refundOnFailure;
+    config.queueDriver = 'worker';
+    config.aiProvider = 'fake';
+    config.openaiApiKey = 'sk-test-openai-video';
+    config.refundOnFailure = true;
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'image-video-openai@example.com');
+    const startingBalance = get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance;
+    const response = await createImageToVideoTask(agent, token, {
+      provider: 'openai',
+      model: 'gpt-image-1',
+      capability: 'image_to_video',
+    });
+    expect(response.status).toBe(201);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance - 40);
+
+    await GenerateTaskJob.handle(response.body.task_id);
+    const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+    const artifacts = all('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+    const outputs = all('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'output']);
+    const refund = get('SELECT * FROM credit_transactions WHERE related_task_id = ? AND type = ?', [response.body.task_id, 'refund']);
+    const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ? ORDER BY id DESC', [response.body.task_id]);
+    const raw = JSON.parse(log.raw_response_json);
+
+    expect(task.status).toBe('failed');
+    expect(task.requested_provider).toBe('openai');
+    expect(task.resolved_provider).toBe('openai');
+    expect(task.last_error_code).toBe('provider_capability_unsupported');
+    expect(task.error_message).toBe('目前尚未設定可用的圖生影片供應商，未產生影片，點數已退回。請到後台設定支援 image_to_video 的供應商後再試。');
+    expect(artifacts).toHaveLength(0);
+    expect(outputs).toHaveLength(0);
+    expect(refund.amount).toBe(40);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance);
+    expect(raw.error_code).toBe('provider_capability_unsupported');
+    expect(raw.retryable).toBe(false);
+    config.queueDriver = previousDriver;
+    config.aiProvider = previousProvider;
+    config.openaiApiKey = previousKey;
+    config.refundOnFailure = previousRefund;
+  });
+
+  it('image_to_video with external provider creates a live video artifact without leaking secrets', async () => {
+    const previousDriver = config.queueDriver;
+    const previousProvider = config.aiProvider;
+    const previousBaseUrl = config.externalAiBaseUrl;
+    const previousApiKey = config.externalAiApiKey;
+    const previousFetch = global.fetch;
+    config.queueDriver = 'worker';
+    config.aiProvider = 'fake';
+    config.externalAiBaseUrl = 'https://external-video.test';
+    config.externalAiApiKey = 'external-secret-test';
+
+    try {
+      global.fetch = async (url, options = {}) => {
+        expect(url).toBe('https://external-video.test/image-to-video');
+        expect(options.headers.Authorization).toBe('Bearer external-secret-test');
+        const body = JSON.parse(options.body);
+        expect(body.task_id).toBeTruthy();
+        expect(body.tool_type).toBe('image_to_video');
+        expect(body.prompt).toBe('Create a short product video.');
+        expect(body.input_images[0].storage_path).toBeTruthy();
+        expect(body.input_images[0].data_url).toMatch(/^data:image\/png;base64,/);
+        expect(body.options.duration_seconds).toBe(5);
+        expect(JSON.stringify(body)).not.toContain('external-secret-test');
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            video_url: 'https://cdn.example.com/videos/product.mp4',
+            mime_type: 'video/mp4',
+            duration_seconds: 5,
+            provider_job_id: 'ext-job-123',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      };
+
+      const agent = request.agent(app);
+      const { token } = await register(agent, 'image-video-external@example.com');
+      const response = await createImageToVideoTask(agent, token, {
+        provider: 'external',
+        capability: 'image_to_video',
+        metadata: { duration_seconds: 5, aspect_ratio: '9:16', motion: 'slow orbit' },
+      });
+      expect(response.status).toBe(201);
+
+      await GenerateTaskJob.handle(response.body.task_id);
+      const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+      const artifact = get('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+      const artifactMeta = JSON.parse(artifact.metadata_json);
+      const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ? ORDER BY id DESC', [response.body.task_id]);
+      const raw = JSON.parse(log.raw_response_json);
+
+      expect(task.status).toBe('success');
+      expect(task.resolved_provider).toBe('external');
+      expect(artifact.kind).toBe('video');
+      expect(artifact.visibility).toBe('private');
+      expect(artifact.content_text).toBe('https://cdn.example.com/videos/product.mp4');
+      expect(artifact.mime_type).toBe('video/mp4');
+      expect(artifactMeta.source).toBe('external');
+      expect(artifactMeta.provider).toBe('external');
+      expect(artifactMeta.provider_job_id).toBe('ext-job-123');
+      expect(artifactMeta.duration_seconds).toBe(5);
+      expect(log.provider).toBe('external');
+      expect(raw.raw.provider_job_id).toBe('ext-job-123');
+      expect(JSON.stringify({ artifactMeta, raw })).not.toContain('external-secret-test');
+    } finally {
+      global.fetch = previousFetch;
+      config.queueDriver = previousDriver;
+      config.aiProvider = previousProvider;
+      config.externalAiBaseUrl = previousBaseUrl;
+      config.externalAiApiKey = previousApiKey;
+    }
+  });
+
+  it('image_to_video with external provider fails and refunds when no video artifact is returned', async () => {
+    const previousDriver = config.queueDriver;
+    const previousProvider = config.aiProvider;
+    const previousBaseUrl = config.externalAiBaseUrl;
+    const previousApiKey = config.externalAiApiKey;
+    const previousRefund = config.refundOnFailure;
+    const previousFetch = global.fetch;
+    config.queueDriver = 'worker';
+    config.aiProvider = 'fake';
+    config.externalAiBaseUrl = 'https://external-video.test';
+    config.externalAiApiKey = 'external-secret-test';
+    config.refundOnFailure = true;
+
+    try {
+      global.fetch = async () =>
+        new Response(JSON.stringify({ ok: false, message: 'missing generated video' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+
+      const agent = request.agent(app);
+      const { user, token } = await register(agent, 'image-video-external-fail@example.com');
+      const startingBalance = get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance;
+      const response = await createImageToVideoTask(agent, token, {
+        provider: 'external',
+        capability: 'image_to_video',
+      });
+      expect(response.status).toBe(201);
+      expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance - 40);
+
+      await GenerateTaskJob.handle(response.body.task_id);
+      const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+      const artifacts = all('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+      const outputs = all('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'output']);
+      const refund = get('SELECT * FROM credit_transactions WHERE related_task_id = ? AND type = ?', [response.body.task_id, 'refund']);
+      const log = get('SELECT * FROM ai_cost_logs WHERE task_id = ? ORDER BY id DESC', [response.body.task_id]);
+      const raw = JSON.parse(log.raw_response_json);
+
+      expect(task.status).toBe('failed');
+      expect(task.last_error_code).toBe('external_provider_failed');
+      expect(task.error_message).toBe('外部圖生影片供應商未回傳可用影片，未產生結果，點數已退回。');
+      expect(artifacts).toHaveLength(0);
+      expect(outputs).toHaveLength(0);
+      expect(JSON.stringify(artifacts)).not.toContain('Fake provider video placeholder');
+      expect(refund.amount).toBe(40);
+      expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance);
+      expect(raw.error_code).toBe('external_provider_failed');
+      expect(raw.retryable).toBe(false);
+    } finally {
+      global.fetch = previousFetch;
+      config.queueDriver = previousDriver;
+      config.aiProvider = previousProvider;
+      config.externalAiBaseUrl = previousBaseUrl;
+      config.externalAiApiKey = previousApiKey;
+      config.refundOnFailure = previousRefund;
+    }
+  });
+
+  it('image_to_video with unconfigured external provider fails and never creates a fake placeholder', async () => {
+    const previousDriver = config.queueDriver;
+    const previousProvider = config.aiProvider;
+    const previousBaseUrl = config.externalAiBaseUrl;
+    const previousApiKey = config.externalAiApiKey;
+    const previousFakeCost = config.fakeTaskCost;
+    const previousRefund = config.refundOnFailure;
+    config.queueDriver = 'worker';
+    config.aiProvider = 'fake';
+    config.externalAiBaseUrl = '';
+    config.externalAiApiKey = '';
+    config.fakeTaskCost = 5;
+    config.refundOnFailure = true;
+
+    try {
+      const agent = request.agent(app);
+      const { user, token } = await register(agent, 'image-video-external-unconfigured@example.com');
+      const startingBalance = get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance;
+      const response = await createImageToVideoTask(agent, token, {
+        provider: 'external',
+        capability: 'image_to_video',
+      });
+      expect(response.status).toBe(201);
+      expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance - 5);
+
+      await GenerateTaskJob.handle(response.body.task_id);
+      const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+      const artifacts = all('SELECT * FROM task_artifacts WHERE task_id = ?', [response.body.task_id]);
+      const refund = get('SELECT * FROM credit_transactions WHERE related_task_id = ? AND type = ?', [response.body.task_id, 'refund']);
+
+      expect(task.status).toBe('failed');
+      expect(task.requested_provider).toBe('external');
+      expect(task.resolved_provider).toBe('fake');
+      expect(task.last_error_code).toBe('provider_capability_unsupported');
+      expect(artifacts).toHaveLength(0);
+      expect(refund.amount).toBe(5);
+      expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(startingBalance);
+    } finally {
+      config.queueDriver = previousDriver;
+      config.aiProvider = previousProvider;
+      config.externalAiBaseUrl = previousBaseUrl;
+      config.externalAiApiKey = previousApiKey;
+      config.fakeTaskCost = previousFakeCost;
+      config.refundOnFailure = previousRefund;
+    }
+  });
+
+  it('sensitive media tasks require consent, audit, and private artifacts', async () => {
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'sensitive-media@example.com');
+
+    const blocked = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'face_swap')
+      .field('product_name', 'Avatar test')
+      .attach('images', png, { filename: 'source.png', contentType: 'image/png' })
+      .attach('images', png, { filename: 'target.png', contentType: 'image/png' });
+    expect(blocked.status).toBe(422);
+    expect(blocked.body.message).toContain('Consent');
+
+    const allowed = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'face_swap')
+      .field('product_name', 'Avatar test')
+      .field('consent_granted', 'true')
+      .field('consent_statement', 'signed release #123')
+      .field('metadata_json', JSON.stringify({ subject: 'released model' }))
+      .attach('images', png, { filename: 'source.png', contentType: 'image/png' })
+      .attach('images', png, { filename: 'target.png', contentType: 'image/png' });
+
+    expect(allowed.status).toBe(201);
+    await waitFor(() => get('SELECT status FROM generation_tasks WHERE id = ?', [allowed.body.task_id])?.status === 'success');
+    const task = get('SELECT * FROM generation_tasks WHERE id = ?', [allowed.body.task_id]);
+    expect(task.privacy_mode).toBe('private');
+    expect(task.consent_required).toBe(1);
+    expect(task.consent_granted).toBe(1);
+    const audit = get('SELECT * FROM audit_logs WHERE action = ? AND target_id = ?', ['sensitive_ai_task_consent', String(allowed.body.task_id)]);
+    expect(audit).toBeTruthy();
+    const artifact = get('SELECT * FROM task_artifacts WHERE task_id = ?', [allowed.body.task_id]);
+    expect(artifact.visibility).toBe('private');
   });
 
   it('rejects invalid upload formats', async () => {
@@ -437,6 +786,28 @@ describe('AI commerce generator MVP', () => {
     expect(providers.find((provider) => provider.name === 'gemini').capabilities).toEqual(
       expect.arrayContaining(['summary', 'classification', 'rewrite', 'extraction', 'planning', 'chat', 'generate', 'image_generation']),
     );
+    expect(providers.find((provider) => provider.name === 'openai').capabilities).not.toContain('image_to_video');
+    expect(providers.find((provider) => provider.name === 'external').capabilities).toContain('image_to_video');
+    const liveMatrix = buildProviderCapabilityMatrix({
+      ...config,
+      externalAiBaseUrl: 'https://external.test',
+      externalAiApiKey: 'external-secret-value',
+    });
+    const liveExternalVideo = liveMatrix.tools
+      .find((tool) => tool.tool_type === 'image_to_video')
+      .providers.find((provider) => provider.name === 'external');
+    expect(liveExternalVideo.supported).toBe(true);
+    expect(liveExternalVideo.live).toBe(true);
+    const offlineMatrix = buildProviderCapabilityMatrix({
+      ...config,
+      externalAiBaseUrl: '',
+      externalAiApiKey: '',
+    });
+    const offlineExternalVideo = offlineMatrix.tools
+      .find((tool) => tool.tool_type === 'image_to_video')
+      .providers.find((provider) => provider.name === 'external');
+    expect(offlineExternalVideo.supported).toBe(true);
+    expect(offlineExternalVideo.live).toBe(false);
     const serialized = JSON.stringify(providers);
     expect(serialized).not.toContain('secret-value');
     expect(serialized).not.toContain('apiKey');
@@ -456,6 +827,171 @@ describe('AI commerce generator MVP', () => {
     expect(validGeminiPing.ok).toBe(true);
     expect(validGeminiPing.live).toBe(false);
     expect(JSON.stringify(validGeminiPing)).not.toContain('gemini-secret');
+  });
+
+  it('rc smoke checklist validates provider matrix guardrails without live AI calls', () => {
+    const result = runRcSmokeChecklist({
+      env: {
+        NODE_ENV: 'development',
+        APP_ENV: 'development',
+        AI_PROVIDER: 'fake',
+        FILESYSTEM_DISK: 'local',
+        QUEUE_DRIVER: 'local',
+        PORT: '3000',
+        APP_URL: 'http://localhost:3000',
+        DATABASE_CLIENT: 'sqlite',
+        DATABASE_URL: 'sqlite',
+      },
+      config: {
+        ...config,
+        nodeEnv: 'development',
+        appEnv: 'development',
+        aiProvider: 'fake',
+        filesystemDisk: 'local',
+        queueDriver: 'local',
+        databaseClient: 'sqlite',
+        databaseUrl: 'sqlite',
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.checklist_path).toBe('docs/RC_SMOKE_CHECKLIST.md');
+    expect(result.guardrails_path).toBe('docs/PROVIDER_TASK_GUARDRAILS.md');
+    expect(result.checks.find((check) => check.key === 'matrix.image_to_video.openai').ok).toBe(true);
+    expect(result.checks.find((check) => check.key === 'matrix.image_to_video.fake').ok).toBe(true);
+    ['voice_clone', 'lip_sync', 'face_swap', 'avatar_video'].forEach((toolType) => {
+      expect(result.checks.find((check) => check.key === `matrix.${toolType}.safety`).ok).toBe(true);
+    });
+    const output = formatRcSmokeChecklist(result);
+    expect(output).toContain('docs/PROVIDER_TASK_GUARDRAILS.md');
+    expect(output).toContain('docs/RC_SMOKE_CHECKLIST.md');
+    expect(output).toContain('npm run mock:external');
+    expect(output).toContain('npm run smoke:external-video');
+  });
+
+  it('provider task guardrail docs exist and pin no-fake-success failure codes', () => {
+    const agents = fs.readFileSync(path.resolve(config.rootDir, 'AGENTS.md'), 'utf8');
+    const guardrailsPath = path.resolve(config.rootDir, 'docs/PROVIDER_TASK_GUARDRAILS.md');
+    const guardrails = fs.readFileSync(guardrailsPath, 'utf8');
+    expect(fs.existsSync(guardrailsPath)).toBe(true);
+    [agents, guardrails].forEach((content) => {
+      expect(content).toContain('No Fake Success');
+      expect(content).toContain('provider_output_invalid');
+      expect(content).toContain('provider_capability_unsupported');
+      expect(content).toContain('external_provider_failed');
+      expect(content).toContain('consent_required');
+    });
+  });
+
+  it('release readiness docs and scripts are present', () => {
+    const docs = [
+      ['docs/RC9_RELEASE_NOTES.md', 'RC9 Release Notes'],
+      ['docs/DEPLOYMENT_PRECHECK.md', 'Deployment Precheck'],
+      ['docs/ROLLBACK.md', 'Rollback'],
+      ['docs/PROVIDER_TASK_GUARDRAILS.md', 'no fake success'],
+      ['docs/PROVIDER_TASK_GUARDRAILS.md', 'provider_capability_unsupported'],
+      ['docs/PROVIDER_TASK_GUARDRAILS.md', 'external_provider_failed'],
+    ];
+    docs.forEach(([relativePath, keyword]) => {
+      const content = fs.readFileSync(path.resolve(config.rootDir, relativePath), 'utf8');
+      expect(content).toContain(keyword);
+    });
+    const packageJson = JSON.parse(fs.readFileSync(path.resolve(config.rootDir, 'package.json'), 'utf8'));
+    ['rc:smoke', 'mock:external', 'smoke:external-video', 'release:check'].forEach((script) => {
+      expect(packageJson.scripts[script]).toBeTruthy();
+    });
+  });
+
+  it('release readiness service validates docs, scripts, env, matrix, and rc smoke without running build/tests', () => {
+    const result = runReleaseReadiness({
+      env: {
+        NODE_ENV: 'development',
+        APP_ENV: 'development',
+        AI_PROVIDER: 'fake',
+        FILESYSTEM_DISK: 'local',
+        QUEUE_DRIVER: 'local',
+        PORT: '3000',
+        APP_URL: 'http://localhost:3000',
+        DATABASE_CLIENT: 'sqlite',
+        DATABASE_URL: 'sqlite',
+      },
+      config: {
+        ...config,
+        nodeEnv: 'development',
+        appEnv: 'development',
+        aiProvider: 'fake',
+        filesystemDisk: 'local',
+        queueDriver: 'local',
+        databaseClient: 'sqlite',
+        databaseUrl: 'sqlite',
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.docs.find((doc) => doc.path === 'docs/RC9_RELEASE_NOTES.md').exists).toBe(true);
+    expect(result.scripts.find((script) => script.name === 'release:check').exists).toBe(true);
+    const output = formatReleaseReadiness(result);
+    expect(output).toContain('RC9 release readiness');
+    expect(output).toContain('npm test');
+    expect(output).toContain('npm run build');
+    expect(output).toContain('npm run rc:smoke');
+  });
+
+  it('mock external provider response builder supports all image-to-video smoke modes', () => {
+    const timestamp = 12345;
+    expect(buildMockImageToVideoResponse('success', timestamp)).toMatchObject({
+      status: 200,
+      body: {
+        ok: true,
+        video_url: 'https://example.com/mock-video.mp4',
+        provider_job_id: 'mock-job-12345',
+      },
+    });
+    expect(buildMockImageToVideoResponse('artifacts', timestamp).body.artifacts[0]).toMatchObject({
+      type: 'video',
+      url: 'https://example.com/mock-artifact-video.mp4',
+      provider_job_id: 'mock-artifact-job-12345',
+    });
+    expect(buildMockImageToVideoResponse('fail').body.ok).toBe(false);
+    expect(buildMockImageToVideoResponse('missing_video')).toMatchObject({
+      status: 200,
+      body: { ok: true, message: 'ok but no usable video' },
+    });
+    expect(buildMockImageToVideoResponse('server_error')).toMatchObject({
+      status: 500,
+      body: { ok: false, error: 'mock server error' },
+    });
+  });
+
+  it('external video smoke validates mocked success and missing-video flows', async () => {
+    const successResponse = buildMockImageToVideoResponse('artifacts', 222);
+    const success = await runExternalVideoSmoke({
+      baseUrl: 'http://mock-external.test',
+      expectedMode: 'artifacts',
+      dbPath: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'external-video-smoke-success-')), 'database.sqlite'),
+      fetchImpl: async (url, options = {}) => {
+        expect(url).toBe('http://mock-external.test/image-to-video');
+        const body = JSON.parse(options.body);
+        expect(body.tool_type).toBe('image_to_video');
+        expect(body.input_images[0].data_url).toMatch(/^data:image\/png;base64,/);
+        return jsonResponse(successResponse.body, successResponse.status);
+      },
+    });
+    expect(success.ok).toBe(true);
+    expect(success.outcome).toBe('success');
+    expect(success.checks.find((check) => check.key === 'artifact.provider').ok).toBe(true);
+
+    const failureResponse = buildMockImageToVideoResponse('missing_video', 333);
+    const failure = await runExternalVideoSmoke({
+      baseUrl: 'http://mock-external.test',
+      expectedMode: 'missing_video',
+      dbPath: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'external-video-smoke-fail-')), 'database.sqlite'),
+      fetchImpl: async () => jsonResponse(failureResponse.body, failureResponse.status),
+    });
+    expect(failure.ok).toBe(true);
+    expect(failure.outcome).toBe('failed');
+    expect(failure.error_code).toBe('external_provider_failed');
+    expect(failure.checks.find((check) => check.key === 'credit.refund').ok).toBe(true);
+    expect(failure.checks.find((check) => check.key === 'task.no_fake_placeholder').ok).toBe(true);
   });
 
   it('GeminiProvider analyze parses mocked JSON and redacts inline image data', async () => {
@@ -1261,6 +1797,96 @@ describe('AI commerce generator MVP', () => {
     config.aiStrictProvider = previousStrict;
   });
 
+  it('OpenAIProvider cutout uses transparent-background image edit', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-cutout@example.com');
+    const response = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'cutout')
+      .field('product_name', 'Snack Pack')
+      .attach('images', png, { filename: 'product.png', contentType: 'image/png' });
+    expect(response.status).toBe(201);
+    expect(get('SELECT requested_capability FROM generation_tasks WHERE id = ?', [response.body.task_id]).requested_capability).toBe(
+      'image_editing',
+    );
+
+    const sourceImage = await makeTransparentCutoutImage(256, 256);
+    let editPayload = null;
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          edit: async (payload) => {
+            editPayload = payload;
+            return {
+              data: [{ b64_json: sourceImage.toString('base64') }],
+              usage: { input_tokens: 3, output_tokens: 0, total_tokens: 3 },
+            };
+          },
+        },
+      },
+    });
+
+    const outputs = await provider.cutoutImage(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]));
+    const metadata = provider.consumeLastRunMetadata();
+
+    expect(editPayload.background).toBe('transparent');
+    expect(editPayload.output_format).toBe('png');
+    expect(editPayload.input_fidelity).toBe('high');
+    expect(outputs[0].mime_type).toBe('image/png');
+    expect(outputs[0].postprocess.transparent_background).toBe(true);
+    expect(outputs[0].postprocess.cutout_validation.output.transparent_pixel_ratio).toBeGreaterThanOrEqual(0.01);
+    expect(fs.existsSync(resolveStoragePath(outputs[0].storage_path))).toBe(true);
+    expect(metadata.provider).toBe('openai');
+    expect(metadata.image_mode).toBe('edit_cutout');
+    expect(metadata.requested_background).toBe('transparent');
+    config.queueDriver = previousDriver;
+  });
+
+  it('OpenAIProvider cutout rejects opaque PNG output without fake fallback', async () => {
+    const previousDriver = config.queueDriver;
+    config.queueDriver = 'worker';
+    const agent = request.agent(app);
+    const { token } = await register(agent, 'openai-cutout-opaque@example.com');
+    const response = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'cutout')
+      .field('product_name', 'Opaque Snack Pack')
+      .attach('images', png, { filename: 'product.png', contentType: 'image/png' });
+    expect(response.status).toBe(201);
+
+    const opaqueImage = await makeImage(256, 256, '#22c55e');
+    let fallbackCalled = false;
+    const provider = new OpenAIProvider({
+      client: {
+        images: {
+          edit: async () => ({
+            data: [{ b64_json: opaqueImage.toString('base64') }],
+            usage: { input_tokens: 3, output_tokens: 0, total_tokens: 3 },
+          }),
+        },
+      },
+      fallbackProvider: {
+        cutoutImage: async () => {
+          fallbackCalled = true;
+          return [];
+        },
+      },
+    });
+
+    await expect(provider.cutoutImage(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]))).rejects.toMatchObject({
+      code: 'provider_output_invalid',
+      retryable: false,
+      message: '智慧去背未產生透明背景，請換一張主體更清楚、背景更單純的圖片後再試。',
+    });
+    expect(fallbackCalled).toBe(false);
+    expect(all('SELECT * FROM task_images WHERE task_id = ? AND type = ?', [response.body.task_id, 'output'])).toHaveLength(0);
+    config.queueDriver = previousDriver;
+  });
+
   it('task metadata parser handles missing fields and exposes debug fields', () => {
     const empty = parseTaskCostMeta();
     const meta = parseTaskCostMeta({
@@ -1284,6 +1910,80 @@ describe('AI commerce generator MVP', () => {
     expect(meta.storageDisk).toBe('r2');
     expect(meta.errorCode).toBe('provider_error');
     expect(imageLoadErrorMessage()).toContain('storage public URL');
+  });
+
+  it('friendlyTaskError converts provider safety rejections to user-friendly Chinese', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'openai',
+      model: 'gpt-image-1',
+      raw_response_json: JSON.stringify({
+        error_code: 'moderation_blocked',
+        error_message:
+          '400 Your request was rejected by the safety system. The request was rejected as a result of our safety system.',
+      }),
+    });
+
+    expect(friendlyTaskError(meta)).toBe(
+      '圖片被供應商安全系統拒絕處理，未產生結果，點數已退回。請換一張較清楚、無敏感人物/角色/商標疑慮的商品圖後再試。',
+    );
+  });
+
+  it('friendlyTaskError keeps normal provider errors on the shortTaskError path', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'openai',
+      model: 'gpt-image-1',
+      raw_response_json: JSON.stringify({
+        error_code: 'provider_timeout',
+        error_message: 'Provider timed out while generating output.',
+      }),
+    });
+
+    expect(friendlyTaskError(meta, 'fallback error')).toBe(shortTaskError(meta, 'fallback error'));
+    expect(friendlyTaskError(meta, 'fallback error')).toBe('Provider timed out while generating output.');
+  });
+
+  it('friendlyTaskError shows cutout output validation guidance', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'openai',
+      model: 'gpt-image-1',
+      raw_response_json: JSON.stringify({
+        error_code: 'provider_output_invalid',
+        error_message: 'opaque output',
+      }),
+    });
+
+    expect(friendlyTaskError(meta)).toBe('智慧去背未產生透明背景，請換一張主體更清楚、背景更單純的圖片後再試。');
+  });
+
+  it('friendlyTaskError shows image-to-video provider capability guidance', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'openai',
+      model: 'gpt-image-1',
+      raw_response_json: JSON.stringify({
+        error_code: 'provider_capability_unsupported',
+        error_message:
+          '目前尚未設定可用的圖生影片供應商，未產生影片，點數已退回。請到後台設定支援 image_to_video 的供應商後再試。',
+      }),
+    });
+
+    expect(friendlyTaskError(meta)).toBe(
+      '目前尚未設定可用的圖生影片供應商，未產生影片，點數已退回。請到後台設定支援圖生影片的供應商後再試。',
+    );
+  });
+
+  it('friendlyTaskError shows external image-to-video provider failure guidance', () => {
+    const meta = parseTaskCostMeta({
+      provider: 'external',
+      model: 'external',
+      raw_response_json: JSON.stringify({
+        error_code: 'external_provider_failed',
+        error_message: '外部圖生影片供應商未回傳可用影片，未產生結果，點數已退回。',
+      }),
+    });
+
+    expect(friendlyTaskError(meta)).toBe(
+      '外部圖生影片供應商未回傳可用影片，未產生結果，點數已退回。請稍後再試或通知管理員檢查供應商設定。',
+    );
   });
 
   it('admin routes require admin and task list tolerates missing metadata', async () => {
@@ -1532,7 +2232,47 @@ describe('AI commerce generator MVP', () => {
     expect(validationTask.status).toBe('failed');
     expect(validationTask.retry_count).toBe(0);
     expect(classifyTaskError({ code: 'storage_error', message: 'R2 timeout' }).retryable).toBe(true);
+    expect(classifyTaskError({ code: 'provider_capability_unsupported', message: 'No video provider.' }).retryable).toBe(false);
+    expect(classifyTaskError({ code: 'external_provider_failed', message: 'No video artifact.' }).retryable).toBe(false);
     config.queueDriver = previousDriver;
+  });
+
+  it('provider_output_invalid is final, refunded, and not retried', async () => {
+    const previousDriver = config.queueDriver;
+    const previousFakeCost = config.fakeTaskCost;
+    const previousRefund = config.refundOnFailure;
+    config.queueDriver = 'worker';
+    config.fakeTaskCost = 5;
+    config.refundOnFailure = true;
+    const agent = request.agent(app);
+    const { user, token } = await register(agent, 'provider-output-invalid@example.com');
+    const response = await agent
+      .post('/studio/tasks')
+      .set('x-csrf-token', token)
+      .field('tool_type', 'cutout')
+      .field('product_name', 'Refund Snack Pack')
+      .attach('images', png, { filename: 'product.png', contentType: 'image/png' });
+    expect(response.status).toBe(201);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(config.freeCreditsOnSignup - 5);
+
+    const error = new Error('智慧去背未產生透明背景，請換一張主體更清楚、背景更單純的圖片後再試。');
+    error.code = 'provider_output_invalid';
+    error.retryable = false;
+    expect(classifyTaskError(error).retryable).toBe(false);
+
+    recordTaskFailure(get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]), error);
+    const task = get('SELECT * FROM generation_tasks WHERE id = ?', [response.body.task_id]);
+    const refund = get('SELECT * FROM credit_transactions WHERE related_task_id = ? AND type = ?', [response.body.task_id, 'refund']);
+
+    expect(task.status).toBe('failed');
+    expect(task.retry_count).toBe(0);
+    expect(task.last_error_code).toBe('provider_output_invalid');
+    expect(task.failure_refunded).toBe(1);
+    expect(refund.amount).toBe(5);
+    expect(get('SELECT credits_balance FROM users WHERE id = ?', [user.id]).credits_balance).toBe(config.freeCreditsOnSignup);
+    config.queueDriver = previousDriver;
+    config.fakeTaskCost = previousFakeCost;
+    config.refundOnFailure = previousRefund;
   });
 
   it('tasks:recover dry run and requeue mutate only when requested', async () => {
@@ -1621,6 +2361,7 @@ describe('AI commerce generator MVP', () => {
     await register(userAgent, 'storage-user@example.com');
     expect((await userAgent.get('/api/admin/storage')).status).toBe(403);
     expect((await userAgent.get('/api/admin/providers')).status).toBe(403);
+    expect((await userAgent.get('/api/admin/provider-capability-matrix')).status).toBe(403);
 
     const adminAgent = request.agent(app);
     const adminSession = await register(adminAgent, 'storage-admin@example.com');
@@ -1642,6 +2383,25 @@ describe('AI commerce generator MVP', () => {
     expect(providers.status).toBe(200);
     expect(providers.body.providers.map((provider) => provider.name)).toEqual(expect.arrayContaining(['fake', 'openai', 'gemini', 'claude', 'devpilot-gateway']));
     expect(JSON.stringify(providers.body)).not.toContain(config.openaiApiKey || 'sk-');
+
+    const matrix = await adminAgent.get('/api/admin/provider-capability-matrix');
+    expect(matrix.status).toBe(200);
+    const imageToVideo = matrix.body.tools.find((tool) => tool.tool_type === 'image_to_video');
+    expect(imageToVideo.required_capability).toBe('image_to_video');
+    expect(imageToVideo.providers.find((provider) => provider.name === 'openai').supported).toBe(false);
+    expect(imageToVideo.providers.find((provider) => provider.name === 'openai').live).toBe(false);
+    const fakeVideo = imageToVideo.providers.find((provider) => provider.name === 'fake');
+    expect(fakeVideo.supported).toBe(true);
+    expect(fakeVideo.live).toBe(false);
+    expect(fakeVideo.fake_only).toBe(true);
+    expect(imageToVideo.providers.find((provider) => provider.name === 'external').supported).toBe(true);
+    expect(imageToVideo.providers.find((provider) => provider.name === 'devpilot-gateway').supported).toBe(true);
+    ['voice_clone', 'lip_sync', 'face_swap', 'avatar_video'].forEach((toolType) => {
+      const sensitive = matrix.body.tools.find((tool) => tool.tool_type === toolType);
+      expect(sensitive.consent_required).toBe(true);
+      expect(sensitive.private_by_default).toBe(true);
+    });
+    expect(matrix.body.tools.find((tool) => tool.tool_type === 'copywriting').required_capability).toBe('generate');
 
     const ping = await adminAgent.post('/api/admin/providers/fake/ping').set('x-csrf-token', adminSession.token).send({});
     expect(ping.status).toBe(200);
@@ -2730,7 +3490,7 @@ describe('AI commerce generator MVP', () => {
     expect(bootstrap.body.registration.invite_code_enabled).toBe(true);
     expect(JSON.stringify(bootstrap.body)).not.toContain('trial-ok');
     const appSource = fs.readFileSync(path.resolve(config.rootDir, 'src/App.jsx'), 'utf8');
-    expect(appSource).toContain('Testing only');
+    expect(appSource).toContain('測試模式');
     expect(appSource).toContain('Trial invite code');
 
     const missingAgent = request.agent(app);

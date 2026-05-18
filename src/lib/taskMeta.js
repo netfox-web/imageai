@@ -62,6 +62,43 @@ export function shortTaskError(meta = emptyTaskCostMeta(), fallback = '') {
   return message.length > 180 ? `${message.slice(0, 180)}...` : message;
 }
 
+const providerSafetyErrorMessage =
+  '圖片被供應商安全系統拒絕處理，未產生結果，點數已退回。請換一張較清楚、無敏感人物/角色/商標疑慮的商品圖後再試。';
+const providerOutputInvalidErrorMessage = '智慧去背未產生透明背景，請換一張主體更清楚、背景更單純的圖片後再試。';
+const providerCapabilityUnsupportedErrorMessage =
+  '目前尚未設定可用的圖生影片供應商，未產生影片，點數已退回。請到後台設定支援圖生影片的供應商後再試。';
+
+const externalProviderFailedErrorMessage =
+  '外部圖生影片供應商未回傳可用影片，未產生結果，點數已退回。請稍後再試或通知管理員檢查供應商設定。';
+
+const providerSafetySignals = [
+  'moderation',
+  'provider_rejected',
+  'policy',
+  'safety',
+  'safety system',
+  'content policy',
+  'your request was rejected',
+  'request was rejected as a result of our safety system',
+];
+
+export function friendlyTaskError(meta = emptyTaskCostMeta(), fallback = '') {
+  const haystack = [meta?.errorCode, meta?.errorMessage, fallback].filter(Boolean).join(' ').toLowerCase();
+  if (haystack.includes('provider_output_invalid')) {
+    return providerOutputInvalidErrorMessage;
+  }
+  if (haystack.includes('provider_capability_unsupported')) {
+    return providerCapabilityUnsupportedErrorMessage;
+  }
+  if (haystack.includes('external_provider_failed')) {
+    return externalProviderFailedErrorMessage;
+  }
+  if (providerSafetySignals.some((signal) => haystack.includes(signal))) {
+    return providerSafetyErrorMessage;
+  }
+  return shortTaskError(meta, fallback);
+}
+
 export function imageLoadErrorMessage() {
   return '圖片可能尚未公開或 storage public URL 設定有誤';
 }

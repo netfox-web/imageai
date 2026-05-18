@@ -15,6 +15,22 @@ export class AIProviderInterface {
     throw new Error('removeText must be implemented.');
   }
 
+  generatePost() {
+    throw new Error('generatePost must be implemented.');
+  }
+
+  mixImages() {
+    throw new Error('mixImages must be implemented.');
+  }
+
+  imageToVideo() {
+    throw new Error('imageToVideo must be implemented.');
+  }
+
+  transformSensitiveMedia() {
+    throw new Error('transformSensitiveMedia must be implemented.');
+  }
+
   analyzeProductImages() {
     throw new Error('analyzeProductImages must be implemented.');
   }

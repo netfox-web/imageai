@@ -2,16 +2,51 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config/index.js';
-import { all, asyncTransaction } from '../db/database.js';
+import { all, asyncTransaction, now } from '../db/database.js';
 import { GenerationTask, TaskFormat, TaskImage, User } from '../models/index.js';
 import { creditService } from './CreditService.js';
 import { validateImageFiles } from './FileValidation.js';
 import { resolveStoragePath, storageService, storageUrl } from './StorageService.js';
 import { queueService } from './QueueService.js';
 import { resolveProviderSelection } from './ProviderSelectionService.js';
+import { recordAuditLog } from './AuditService.js';
 
-const validTools = new Set(['banner', 'translation', 'cutout', 'removal']);
+const validTools = new Set([
+  'banner',
+  'translation',
+  'cutout',
+  'removal',
+  'post_generator',
+  'image_mix',
+  'image_to_video',
+  'voice_clone',
+  'lip_sync',
+  'face_swap',
+  'avatar',
+  'avatar_video',
+]);
 const validRoles = new Set(['cover', 'white_bg', 'feature', 'scenario', 'detail', 'comparison', 'multi_use', 'info']);
+const optionalImageTools = new Set(['post_generator']);
+const twoImageTools = new Set(['image_mix', 'face_swap']);
+const sensitiveTools = new Set(['voice_clone', 'lip_sync', 'face_swap', 'avatar', 'avatar_video']);
+const defaultToolCapabilities = {
+  banner: 'image_generation',
+  translation: 'image_editing',
+  cutout: 'image_editing',
+  removal: 'image_editing',
+  post_generator: 'post_generation',
+  image_mix: 'image_mix',
+  image_to_video: 'image_to_video',
+  voice_clone: 'sensitive_media',
+  lip_sync: 'sensitive_media',
+  face_swap: 'sensitive_media',
+  avatar: 'sensitive_media',
+  avatar_video: 'sensitive_media',
+};
+
+function defaultCapabilityForTool(toolType) {
+  return defaultToolCapabilities[toolType] || 'generate';
+}
 
 function parseJsonField(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -35,6 +70,8 @@ function asArray(value) {
 }
 
 function taskPayloadFromRequest(body, files) {
+  const toolType = body.tool_type || 'banner';
+  const requestedCapability = body.capability || body.requested_capability;
   const formatIds = asArray(body.platform_format_ids || body.format_ids).map(Number).filter(Boolean);
   const customFormats = asArray(body.custom_formats || body.customFormats)
     .map((format) => ({
@@ -44,7 +81,7 @@ function taskPayloadFromRequest(body, files) {
     .filter((format) => format.custom_width && format.custom_height);
 
   return {
-    tool_type: body.tool_type || 'banner',
+    tool_type: toolType,
     product_name: body.product_name || null,
     main_title: body.main_title || null,
     subtitle: body.subtitle || null,
@@ -63,18 +100,27 @@ function taskPayloadFromRequest(body, files) {
     image_count: files.length,
     provider: body.provider || body.requested_provider || '',
     model: body.model || body.requested_model || '',
-    capability: body.capability || body.requested_capability || 'generate',
+    capability: requestedCapability && requestedCapability !== 'auto' ? requestedCapability : defaultCapabilityForTool(toolType),
     strict_provider: body.strict_provider === 'true' || body.strict_provider === true || body.strict_provider === '1',
     quality_review_required:
       body.quality_review_required === 'true' || body.quality_review_required === true || body.quality_review_required === '1',
+    metadata: parseJsonField(body.metadata_json || body.metadata || body.input_metadata_json, {}),
+    privacy_mode: body.privacy_mode === 'shared' ? 'shared' : 'private',
+    consent_granted: body.consent_granted === 'true' || body.consent_granted === true || body.consent_granted === '1',
+    consent_statement: String(body.consent_statement || '').slice(0, 1200),
   };
 }
 
 function validateTaskPayload(payload, files) {
-  validateImageFiles(files);
+  const minImages = optionalImageTools.has(payload.tool_type) ? 0 : twoImageTools.has(payload.tool_type) ? 2 : 1;
+  validateImageFiles(files, minImages);
 
   if (!validTools.has(payload.tool_type)) {
     throw validationError('不支援的工具類型');
+  }
+
+  if (sensitiveTools.has(payload.tool_type) && !payload.consent_granted) {
+    throw validationError('Consent is required for voice cloning, lip sync, face swap, and avatar tasks.');
   }
 
   if (payload.tool_type === 'banner') {
@@ -118,7 +164,7 @@ async function cleanup(files) {
 }
 
 export class TaskService {
-  async createTask(userId, body, files) {
+  async createTask(userId, body, files, req = null) {
     const user = User.find(userId);
     if (!user) {
       throw validationError('請先登入', 401);
@@ -180,6 +226,13 @@ export class TaskService {
           fallback_reason: providerSelection.fallback_reason,
           strict_provider: payload.strict_provider ? 1 : 0,
           quality_review_required: payload.quality_review_required ? 1 : 0,
+          input_metadata_json: JSON.stringify(payload.metadata || {}),
+          output_metadata_json: null,
+          consent_required: sensitiveTools.has(payload.tool_type) ? 1 : 0,
+          consent_granted: payload.consent_granted ? 1 : 0,
+          consent_statement: payload.consent_statement || null,
+          consent_granted_at: payload.consent_granted ? now() : null,
+          privacy_mode: sensitiveTools.has(payload.tool_type) ? 'private' : payload.privacy_mode,
         });
 
         for (let index = 0; index < files.length; index += 1) {
@@ -219,6 +272,23 @@ export class TaskService {
         });
 
         creditService.consume(user, creditsCost, taskId, '建立生成任務扣點');
+        if (sensitiveTools.has(payload.tool_type)) {
+          recordAuditLog({
+            actorType: user.role === 'admin' ? 'admin' : 'user',
+            actorId: user.id,
+            action: 'sensitive_ai_task_consent',
+            targetType: 'generation_task',
+            targetId: taskId,
+            metadata: {
+              tool_type: payload.tool_type,
+              consent_granted: true,
+              privacy_mode: 'private',
+              consent_statement: payload.consent_statement,
+            },
+            ip: req?.ip,
+            userAgent: req?.get?.('user-agent'),
+          });
+        }
       });
     } catch (error) {
       await cleanup(savedFiles);
@@ -249,6 +319,7 @@ export class TaskService {
       output_images: images.filter((image) => image.type === 'output'),
       formats: GenerationTask.formats(task.id),
       ai_cost_logs: GenerationTask.costLogs(task.id),
+      artifacts: GenerationTask.artifacts(task.id),
       quality_reviews: all('SELECT * FROM quality_reviews WHERE task_id = ? ORDER BY id DESC', [Number(task.id)]),
       regeneration_requests: all('SELECT * FROM task_regeneration_requests WHERE task_id = ? ORDER BY id DESC', [Number(task.id)]),
       handoffs: all(

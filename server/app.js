@@ -52,6 +52,7 @@ import {
   saveDevPilotExternalKey,
 } from './services/DevPilotExternalKeyService.js';
 import { getProvider, listProviders, pingProvider, validateProviderConfig } from './services/AIProviderRegistry.js';
+import { buildProviderCapabilityMatrix } from './services/ProviderCapabilityMatrix.js';
 import {
   batchUpdateAssets,
   createAssetShareToken,
@@ -488,7 +489,7 @@ function registerStudioRoutes(app) {
 
   app.post('/studio/tasks', taskCreateLimiter, requireAuth, imageUpload.array('images', 10), async (req, res, next) => {
     try {
-      const result = await taskService.createTask(req.user.id, req.body, req.files || []);
+      const result = await taskService.createTask(req.user.id, req.body, req.files || [], req);
       res.status(201).json(result);
     } catch (error) {
       next(error);
@@ -670,13 +671,20 @@ function registerMemberRoutes(app) {
           watermark_path: watermarkPath,
           default_language: req.body.default_language || 'zh-TW',
           default_logo_mode: req.body.default_logo_mode || 'keep',
+          brand_voice: req.body.brand_voice || null,
+          target_audience: req.body.target_audience || null,
+          brand_keywords: req.body.brand_keywords || null,
+          forbidden_terms: req.body.forbidden_terms || null,
+          product_pillars: req.body.product_pillars || null,
+          sample_posts: req.body.sample_posts || null,
           updated_at: now(),
         };
         if (current) {
           run(
             `UPDATE user_brand_settings
              SET brand_name = ?, logo_path = ?, primary_color = ?, secondary_color = ?, watermark_path = ?,
-                 default_language = ?, default_logo_mode = ?, updated_at = ?
+                 default_language = ?, default_logo_mode = ?, brand_voice = ?, target_audience = ?,
+                 brand_keywords = ?, forbidden_terms = ?, product_pillars = ?, sample_posts = ?, updated_at = ?
              WHERE user_id = ?`,
             [
               values.brand_name,
@@ -686,6 +694,12 @@ function registerMemberRoutes(app) {
               values.watermark_path,
               values.default_language,
               values.default_logo_mode,
+              values.brand_voice,
+              values.target_audience,
+              values.brand_keywords,
+              values.forbidden_terms,
+              values.product_pillars,
+              values.sample_posts,
               values.updated_at,
               req.user.id,
             ],
@@ -693,8 +707,10 @@ function registerMemberRoutes(app) {
         } else {
           insert(
             `INSERT INTO user_brand_settings
-             (user_id, brand_name, logo_path, primary_color, secondary_color, watermark_path, default_language, default_logo_mode, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (user_id, brand_name, logo_path, primary_color, secondary_color, watermark_path,
+              default_language, default_logo_mode, brand_voice, target_audience, brand_keywords,
+              forbidden_terms, product_pillars, sample_posts, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               req.user.id,
               values.brand_name,
@@ -704,6 +720,12 @@ function registerMemberRoutes(app) {
               values.watermark_path,
               values.default_language,
               values.default_logo_mode,
+              values.brand_voice,
+              values.target_audience,
+              values.brand_keywords,
+              values.forbidden_terms,
+              values.product_pillars,
+              values.sample_posts,
               now(),
               now(),
             ],
@@ -1173,6 +1195,10 @@ function registerAdminRoutes(app) {
     res.json({ providers: listProviders(), lastPing: await readAiPingLastReport() });
   });
 
+  app.get('/api/admin/provider-capability-matrix', requireAdmin, (_req, res) => {
+    res.json(buildProviderCapabilityMatrix());
+  });
+
   app.get('/api/admin/providers/:provider/validate', requireAdmin, (req, res) => {
     res.json(validateProviderConfig(req.params.provider));
   });
@@ -1431,6 +1457,13 @@ function duplicateTaskForUser({ taskId, user, req }) {
       fallback_reason: task.fallback_reason,
       strict_provider: task.strict_provider,
       quality_review_required: task.quality_review_required,
+      input_metadata_json: task.input_metadata_json,
+      output_metadata_json: null,
+      consent_required: task.consent_required,
+      consent_granted: task.consent_granted,
+      consent_statement: task.consent_statement,
+      consent_granted_at: task.consent_granted_at,
+      privacy_mode: task.privacy_mode || 'private',
     });
     GenerationTask.images(task.id, 'input').forEach((image) => {
       TaskImage.create({
@@ -2239,6 +2272,12 @@ function defaultBrandSettings(userId) {
     watermark_path: null,
     default_language: 'zh-TW',
     default_logo_mode: 'keep',
+    brand_voice: null,
+    target_audience: null,
+    brand_keywords: null,
+    forbidden_terms: null,
+    product_pillars: null,
+    sample_posts: null,
   };
 }
 

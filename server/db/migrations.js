@@ -119,6 +119,13 @@ export async function migrate() {
     addColumnIfMissing('generation_tasks', 'fallback_reason', 'TEXT NULL');
     addColumnIfMissing('generation_tasks', 'strict_provider', 'INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('generation_tasks', 'quality_review_required', 'INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('generation_tasks', 'input_metadata_json', 'TEXT NULL');
+    addColumnIfMissing('generation_tasks', 'output_metadata_json', 'TEXT NULL');
+    addColumnIfMissing('generation_tasks', 'consent_required', 'INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('generation_tasks', 'consent_granted', 'INTEGER NOT NULL DEFAULT 0');
+    addColumnIfMissing('generation_tasks', 'consent_statement', 'TEXT NULL');
+    addColumnIfMissing('generation_tasks', 'consent_granted_at', 'TEXT NULL');
+    addColumnIfMissing('generation_tasks', 'privacy_mode', "TEXT NOT NULL DEFAULT 'private'");
   }
 
   run(`
@@ -133,6 +140,24 @@ export async function migrate() {
       file_size INTEGER NULL,
       mime_type TEXT NULL,
       sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT NULL,
+      FOREIGN KEY (task_id) REFERENCES generation_tasks(id) ON DELETE CASCADE
+    )
+  `);
+
+  run(`
+    CREATE TABLE IF NOT EXISTS task_artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('text', 'video', 'audio', 'json', 'external_ref')),
+      title TEXT NULL,
+      content_text TEXT NULL,
+      storage_path TEXT NULL,
+      mime_type TEXT NULL,
+      metadata_json TEXT NULL,
+      visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'shared')),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       deleted_at TEXT NULL,
@@ -239,6 +264,15 @@ export async function migrate() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
+
+  if (hasTable('user_brand_settings')) {
+    addColumnIfMissing('user_brand_settings', 'brand_voice', 'TEXT NULL');
+    addColumnIfMissing('user_brand_settings', 'target_audience', 'TEXT NULL');
+    addColumnIfMissing('user_brand_settings', 'brand_keywords', 'TEXT NULL');
+    addColumnIfMissing('user_brand_settings', 'forbidden_terms', 'TEXT NULL');
+    addColumnIfMissing('user_brand_settings', 'product_pillars', 'TEXT NULL');
+    addColumnIfMissing('user_brand_settings', 'sample_posts', 'TEXT NULL');
+  }
 
   run(`
     CREATE TABLE IF NOT EXISTS credit_packages (
@@ -460,6 +494,7 @@ export async function migrate() {
 
   run('CREATE INDEX IF NOT EXISTS idx_generation_tasks_user_status ON generation_tasks(user_id, status)');
   run('CREATE INDEX IF NOT EXISTS idx_task_images_task_type ON task_images(task_id, type)');
+  run('CREATE INDEX IF NOT EXISTS idx_task_artifacts_task_kind ON task_artifacts(task_id, kind)');
   run('CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_created ON credit_transactions(user_id, created_at)');
   run('CREATE INDEX IF NOT EXISTS idx_quality_reviews_task ON quality_reviews(task_id)');
   run('CREATE INDEX IF NOT EXISTS idx_ai_handoff_logs_conversation_source ON ai_handoff_logs(conversation_ref, source_system)');

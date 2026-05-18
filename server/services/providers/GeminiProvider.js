@@ -143,6 +143,46 @@ export class GeminiProvider extends AIProviderInterface {
     return this.fallbackProvider.removeText(task);
   }
 
+  async generatePost(task) {
+    return this.withFallback('generatePost', [task], async () => {
+      const result = await this.generateText({ prompt: buildPostPrompt(task), model: task.requested_model || config.geminiModel });
+      if (!result.ok) {
+        const error = new Error(result.error_message || 'Gemini post generation failed.');
+        error.code = result.error_code;
+        error.retryable = result.retryable;
+        throw error;
+      }
+      this.lastRunMetadata = {
+        provider: this.providerName,
+        model: result.model,
+        usage: result.usage,
+        cost_usd: null,
+        artifact_count: 1,
+        raw_response_json: result.raw_response_json_safe,
+      };
+      return [{
+        kind: 'text',
+        title: 'Generated post',
+        content_text: result.output,
+        mime_type: 'text/plain',
+        visibility: 'private',
+        metadata: { provider: this.providerName },
+      }];
+    });
+  }
+
+  async mixImages(task) {
+    return this.fallbackProvider.mixImages(task);
+  }
+
+  async imageToVideo(task) {
+    return this.fallbackProvider.imageToVideo(task);
+  }
+
+  async transformSensitiveMedia(task) {
+    return this.fallbackProvider.transformSensitiveMedia(task);
+  }
+
   async generateContent(body) {
     const baseUrl = String(config.geminiBaseUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
     const model = encodeURIComponent(config.geminiModel || 'gemini-1.5-flash');
@@ -272,4 +312,21 @@ function isRetryableError(error) {
 function redactSecret(message = '', secret = '') {
   const text = String(message || '');
   return secret ? text.replaceAll(secret, '[redacted]') : text;
+}
+
+function buildPostPrompt(task) {
+  let metadata = {};
+  try {
+    metadata = JSON.parse(task.input_metadata_json || '{}');
+  } catch {}
+  return [
+    'Write concise ecommerce social post copy.',
+    `Language: ${task.language || 'zh-TW'}`,
+    `Product: ${task.product_name || ''}`,
+    `Main title: ${task.main_title || ''}`,
+    `Subtitle: ${task.subtitle || ''}`,
+    `Brand/channel metadata: ${JSON.stringify(metadata)}`,
+    `Extra instruction: ${task.custom_prompt || ''}`,
+    'Return ready-to-publish copy with a short CTA and 3-5 hashtags.',
+  ].join('\n');
 }

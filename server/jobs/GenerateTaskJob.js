@@ -1,8 +1,12 @@
 import { now } from '../db/database.js';
-import { AiCostLog, GenerationTask, TaskImage } from '../models/index.js';
+import { AiCostLog, GenerationTask, TaskArtifact, TaskImage } from '../models/index.js';
 import { config } from '../config/index.js';
 import { resolveAIProvider } from '../services/AIProviderFactory.js';
 import { recordTaskFailure } from '../services/TaskFailurePolicy.js';
+import { getProviderDefinition } from '../services/AIProviderRegistry.js';
+
+const imageToVideoUnsupportedMessage =
+  '目前尚未設定可用的圖生影片供應商，未產生影片，點數已退回。請到後台設定支援 image_to_video 的供應商後再試。';
 
 export class GenerateTaskJob {
   static queue = [];
@@ -60,6 +64,7 @@ export class GenerateTaskJob {
       modelName = provider.modelName || providerName;
       const freshTask = GenerationTask.find(task.id);
       let outputs = [];
+      let artifacts = [];
 
       if (freshTask.tool_type === 'banner') {
         outputs = await provider.generateBanner(freshTask);
@@ -69,6 +74,19 @@ export class GenerateTaskJob {
         outputs = await provider.cutoutImage(freshTask);
       } else if (freshTask.tool_type === 'removal') {
         outputs = await provider.removeText(freshTask);
+      } else if (freshTask.tool_type === 'post_generator') {
+        artifacts = await provider.generatePost(freshTask);
+      } else if (freshTask.tool_type === 'image_mix') {
+        outputs = await provider.mixImages(freshTask);
+      } else if (freshTask.tool_type === 'image_to_video') {
+        assertImageToVideoProviderSupported(freshTask, provider);
+        const result = normalizeMediaResult(await provider.imageToVideo(freshTask));
+        outputs = result.outputs;
+        artifacts = result.artifacts;
+      } else if (['voice_clone', 'lip_sync', 'face_swap', 'avatar', 'avatar_video'].includes(freshTask.tool_type)) {
+        const result = normalizeMediaResult(await provider.transformSensitiveMedia(freshTask));
+        outputs = result.outputs;
+        artifacts = result.artifacts;
       } else {
         throw new Error(`Unsupported tool_type: ${freshTask.tool_type}`);
       }
@@ -93,6 +111,20 @@ export class GenerateTaskJob {
         });
       });
 
+      artifacts.forEach((artifact) => {
+        TaskArtifact.create({
+          task_id: freshTask.id,
+          kind: artifact.kind || 'text',
+          title: artifact.title || null,
+          content_text: artifact.content_text || artifact.content || null,
+          storage_path: artifact.storage_path || null,
+          mime_type: artifact.mime_type || null,
+          metadata_json: JSON.stringify(artifact.metadata || {}),
+          visibility: artifact.visibility === 'shared' && freshTask.privacy_mode === 'shared' ? 'shared' : 'private',
+          deleted_at: null,
+        });
+      });
+
       AiCostLog.create({
         task_id: freshTask.id,
         provider: runMetadata.provider || provider.providerName || 'unknown',
@@ -103,6 +135,7 @@ export class GenerateTaskJob {
         cost_usd: runMetadata.cost_usd ?? (runMetadata.provider === 'fake' || provider.providerName === 'fake' ? 0 : null),
         raw_response_json: JSON.stringify({
           outputCount: outputs.length,
+          artifact_count: artifacts.length,
           provider: runMetadata.provider || provider.providerName || 'unknown',
           model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
           image_count: outputs.length,
@@ -132,6 +165,11 @@ export class GenerateTaskJob {
             generation_size: image.generation_size || null,
             postprocess: image.postprocess || null,
           })),
+          artifacts: artifacts.map((artifact) => ({
+            kind: artifact.kind || 'text',
+            title: artifact.title || null,
+            visibility: artifact.visibility === 'shared' && freshTask.privacy_mode === 'shared' ? 'shared' : 'private',
+          })),
           raw: runMetadata.raw_response_json || null,
           error: runMetadata.error || null,
         }),
@@ -154,4 +192,39 @@ export class GenerateTaskJob {
       });
     }
   }
+}
+
+function providerCapabilityUnsupportedError() {
+  const error = new Error(imageToVideoUnsupportedMessage);
+  error.code = 'provider_capability_unsupported';
+  error.retryable = false;
+  return error;
+}
+
+function assertImageToVideoProviderSupported(task, provider) {
+  const providerName = String(provider.providerName || task.resolved_provider || '').toLowerCase();
+  const requestedProvider = String(task.requested_provider || '').toLowerCase();
+  const resolvedProvider = String(task.resolved_provider || providerName || '').toLowerCase();
+  const explicitFake = providerName === 'fake' && requestedProvider === 'fake' && resolvedProvider === 'fake';
+  if (explicitFake) return;
+  if (providerName === 'fake') {
+    throw providerCapabilityUnsupportedError();
+  }
+
+  const definition = getProviderDefinition(resolvedProvider || providerName);
+  const capabilities = definition.capabilities || [];
+  const supportsLiveVideo = Boolean(definition.supportsImageToVideo || capabilities.includes('video_generation'));
+  if (!supportsLiveVideo) {
+    throw providerCapabilityUnsupportedError();
+  }
+}
+
+function normalizeMediaResult(result) {
+  if (Array.isArray(result)) {
+    return { outputs: [], artifacts: result };
+  }
+  return {
+    outputs: Array.isArray(result?.outputs) ? result.outputs : [],
+    artifacts: Array.isArray(result?.artifacts) ? result.artifacts : [],
+  };
 }

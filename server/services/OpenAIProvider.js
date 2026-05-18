@@ -1,4 +1,5 @@
 import OpenAI, { toFile } from 'openai';
+import sharp from 'sharp';
 import { config } from '../config/index.js';
 import { GenerationTask, StylePreset } from '../models/index.js';
 import { fallbackPrompts, renderPromptByKey, taskPromptVariables } from './PromptRenderer.js';
@@ -86,6 +87,32 @@ function isRetryableProviderError(error) {
   return error.name === 'AbortError' || error.name === 'TimeoutError' || error instanceof TypeError || status === 429 || status >= 500;
 }
 
+function isProviderSafetyRejection(error = {}) {
+  const code = String(error.code || error.name || '').toLowerCase();
+  const message = String(error.message || '').toLowerCase();
+  const status = Number(error.status || 0);
+  return (
+    status === 400 &&
+    (code.includes('policy') ||
+      code.includes('safety') ||
+      message.includes('safety system') ||
+      message.includes('content policy') ||
+      message.includes('policy violation') ||
+      message.includes('your request was rejected') ||
+      message.includes('request was rejected as a result of our safety system'))
+  );
+}
+
+function markProviderRejection(error) {
+  error.code = error.code || 'provider_rejected';
+  error.retryable = false;
+  return error;
+}
+
+function isProviderOutputInvalid(error = {}) {
+  return String(error.code || '').toLowerCase() === 'provider_output_invalid';
+}
+
 function redactSecret(message = '', secret = '') {
   const text = String(message || '');
   return secret ? text.replaceAll(secret, '[redacted]') : text;
@@ -105,6 +132,55 @@ function closestSupportedSize(width, height) {
 function parseSize(size) {
   const [width, height] = String(size || '').split('x').map(Number);
   return { width: Number.isFinite(width) ? width : null, height: Number.isFinite(height) ? height : null };
+}
+
+function providerOutputInvalidError() {
+  const error = new Error('智慧去背未產生透明背景，請換一張主體更清楚、背景更單純的圖片後再試。');
+  error.code = 'provider_output_invalid';
+  error.retryable = false;
+  return error;
+}
+
+async function validateCutoutPngAlpha(buffer) {
+  let metadata;
+  try {
+    metadata = await sharp(buffer, { failOn: 'none' }).metadata();
+  } catch {
+    throw providerOutputInvalidError();
+  }
+
+  if (metadata.format !== 'png' || !metadata.hasAlpha) {
+    throw providerOutputInvalidError();
+  }
+
+  let data;
+  let info;
+  try {
+    ({ data, info } = await sharp(buffer, { failOn: 'none' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }));
+  } catch {
+    throw providerOutputInvalidError();
+  }
+  const channels = Number(info.channels || 0);
+  const pixelCount = Number(info.width || 0) * Number(info.height || 0);
+  if (channels < 4 || pixelCount < 1) {
+    throw providerOutputInvalidError();
+  }
+
+  let transparentPixels = 0;
+  for (let index = channels - 1; index < data.length; index += channels) {
+    if (data[index] < 250) transparentPixels += 1;
+  }
+
+  const transparentRatio = transparentPixels / pixelCount;
+  if (transparentRatio < 0.01) {
+    throw providerOutputInvalidError();
+  }
+
+  return {
+    format: metadata.format,
+    has_alpha: Boolean(metadata.hasAlpha),
+    transparent_pixel_ratio: transparentRatio,
+  };
 }
 
 function formatDescriptor(format) {
@@ -402,7 +478,7 @@ export class OpenAIProvider extends AIProviderInterface {
         fallbackReason: null,
       };
     } catch (error) {
-      if (config.aiStrictProvider) throw error;
+      if (config.aiStrictProvider || isProviderSafetyRejection(error)) throw markProviderRejection(error);
       return {
         response: await generate(),
         imageMode: 'generate',
@@ -417,15 +493,148 @@ export class OpenAIProvider extends AIProviderInterface {
   }
 
   async translateImage(task) {
-    return this.fallbackProvider.translateImage(task);
+    return this.withFallback('translateImage', [task], async () => {
+      throw new Error('OpenAI image translation is not implemented yet.');
+    });
   }
 
   async cutoutImage(task) {
-    return this.fallbackProvider.cutoutImage(task);
+    return this.withFallback('cutoutImage', [task], async () => {
+      const freshTask = GenerationTask.find(task.id);
+      const inputs = GenerationTask.images(freshTask.id, 'input');
+      if (!inputs.length) throw new Error('At least one input image is required for OpenAI cutout.');
+
+      const outputs = [];
+      const rawResponses = [];
+      const usageTotals = {};
+
+      for (const input of inputs) {
+        const generationSize = closestSupportedSize(input.width, input.height);
+        const referenceBuffer = await storageService.read(input.storage_path);
+        const referenceFile = await toFile(referenceBuffer, `task-cutout-${input.id || Date.now()}.png`, {
+          type: input.mime_type || 'image/png',
+        });
+        const response = await this.imagesEdit({
+          model: config.openaiImageModel,
+          image: referenceFile,
+          prompt: buildCutoutPrompt(freshTask),
+          size: generationSize,
+          n: 1,
+          background: 'transparent',
+          output_format: 'png',
+          input_fidelity: 'high',
+        });
+        rawResponses.push({
+          image_mode: 'edit_cutout',
+          requested_background: 'transparent',
+          response: sanitizeRawResponse(response),
+        });
+        mergeUsage(usageTotals, response.usage);
+
+        const image = response.data?.[0];
+        const buffer = image?.b64_json ? Buffer.from(image.b64_json, 'base64') : await this.fetchImageBuffer(image?.url);
+        const sourceValidation = await validateCutoutPngAlpha(buffer);
+        const processed = await postProcessImage(buffer, {
+          taskId: freshTask.id,
+          format: { label: 'cutout' },
+          index: outputs.length,
+          outputFormat: 'png',
+        });
+        const outputValidation = await validateCutoutPngAlpha(processed.buffer);
+        const storagePath = await storageService.putOutput(processed.buffer, processed.filename);
+        const generated = parseSize(generationSize);
+        outputs.push({
+          storage_path: storagePath,
+          width: processed.width,
+          height: processed.height,
+          file_size: processed.file_size,
+          mime_type: processed.mime_type,
+          generation_size: generationSize,
+          generated_width: generated.width,
+          generated_height: generated.height,
+          source_image_id: input.id,
+          postprocess: {
+            ...processed.postprocess,
+            transparent_background: true,
+            cutout_validation: {
+              source: sourceValidation,
+              output: outputValidation,
+            },
+          },
+        });
+      }
+
+      this.lastRunMetadata = {
+        provider: this.providerName,
+        model: config.openaiImageModel,
+        image_count: outputs.length,
+        usage: Object.keys(usageTotals).length ? usageTotals : null,
+        cost_usd: null,
+        image_mode: 'edit_cutout',
+        used_reference_image: true,
+        requested_background: 'transparent',
+        raw_response_json: {
+          requested: outputs.map((output) => ({
+            generation_size: output.generation_size,
+            postprocess: output.postprocess,
+          })),
+          responses: rawResponses,
+        },
+      };
+
+      return outputs;
+    });
   }
 
   async removeText(task) {
-    return this.fallbackProvider.removeText(task);
+    return this.withFallback('removeText', [task], async () => {
+      throw new Error('OpenAI text removal is not implemented yet.');
+    });
+  }
+
+  async generatePost(task) {
+    return this.withFallback('generatePost', [task], async () => {
+      const result = await this.generateText({
+        prompt: buildPostPrompt(task),
+        model: task.requested_model || config.openaiTextModel,
+      });
+      if (!result.ok) {
+        const error = new Error(result.error_message || 'OpenAI post generation failed.');
+        error.code = result.error_code;
+        error.retryable = result.retryable;
+        throw error;
+      }
+      this.lastRunMetadata = {
+        provider: this.providerName,
+        model: result.model,
+        usage: result.usage,
+        cost_usd: null,
+        artifact_count: 1,
+        raw_response_json: result.raw_response_json_safe,
+      };
+      return [
+        {
+          kind: 'text',
+          title: 'Generated post',
+          content_text: result.output,
+          mime_type: 'text/plain',
+          visibility: 'private',
+          metadata: { provider: this.providerName },
+        },
+      ];
+    });
+  }
+
+  async mixImages(task) {
+    return this.fallbackProvider.mixImages(task);
+  }
+
+  async imageToVideo(task) {
+    return this.fallbackProvider.imageToVideo(task);
+  }
+
+  async transformSensitiveMedia(task) {
+    return this.fallbackProvider.transformSensitiveMedia(task);
   }
 
   async responsesCreate(payload) {
@@ -457,7 +666,8 @@ export class OpenAIProvider extends AIProviderInterface {
     try {
       return await callback();
     } catch (error) {
-      if (config.aiStrictProvider) throw error;
+      if (isProviderOutputInvalid(error)) throw error;
+      if (config.aiStrictProvider || isProviderSafetyRejection(error)) throw markProviderRejection(error);
       const result = await this.fallbackProvider[method](...args);
       const metadata = {
         provider: 'fake',
@@ -475,4 +685,31 @@ export class OpenAIProvider extends AIProviderInterface {
       return result;
     }
   }
+}
+
+function buildCutoutPrompt(task) {
+  return [
+    'Create a precise transparent-background product cutout from the supplied image.',
+    'Preserve the product, packaging, labels, logo, colors, proportions, and readable text exactly.',
+    'Remove the table, room, scenery, shadows, reflections, hands, and all surrounding background pixels.',
+    'Do not add new text, new packaging details, decorative graphics, or a replacement background.',
+    `Product context: ${task.product_name || task.main_title || 'product image'}.`,
+  ].join('\n');
+}
+
+function buildPostPrompt(task) {
+  let metadata = {};
+  try {
+    metadata = JSON.parse(task.input_metadata_json || '{}');
+  } catch {}
+  return [
+    'Write concise ecommerce social post copy.',
+    `Language: ${task.language || 'zh-TW'}`,
+    `Product: ${task.product_name || ''}`,
+    `Main title: ${task.main_title || ''}`,
+    `Subtitle: ${task.subtitle || ''}`,
+    `Brand/channel metadata: ${JSON.stringify(metadata)}`,
+    `Extra instruction: ${task.custom_prompt || ''}`,
+    'Return ready-to-publish copy with a short CTA and 3-5 hashtags.',
+  ].join('\n');
 }

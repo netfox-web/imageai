@@ -8,6 +8,8 @@ import {
   Download,
   Heart,
   Image as ImageIcon,
+  FileText,
+  Layers,
   LayoutDashboard,
   Loader2,
   LogOut,
@@ -19,11 +21,12 @@ import {
   Sparkles,
   UploadCloud,
   User,
+  Video,
   Wand2,
   X,
 } from 'lucide-react';
 import { api, loadSession } from './lib/api.js';
-import { imageLoadErrorMessage, parseTaskCostMeta, shortTaskError } from './lib/taskMeta.js';
+import { friendlyTaskError, imageLoadErrorMessage, parseTaskCostMeta } from './lib/taskMeta.js';
 
 const roleLabels = {
   cover: '封面圖',
@@ -41,7 +44,46 @@ const toolLabels = {
   translation: '圖片翻譯',
   cutout: '智慧去背',
   removal: '智慧去字',
+  post_generator: '貼文生成器',
+  image_mix: '圖片混合',
+  image_to_video: '圖生影片',
+  voice_clone: '聲音克隆',
+  lip_sync: '對嘴影片',
+  face_swap: '換臉',
+  avatar: 'Avatar',
+  avatar_video: 'Avatar 影片',
 };
+
+const sensitiveToolTypes = ['voice_clone', 'lip_sync', 'face_swap', 'avatar', 'avatar_video'];
+
+const toolCapabilityMap = {
+  banner: 'image_generation',
+  translation: 'image_editing',
+  cutout: 'image_editing',
+  removal: 'image_editing',
+  post_generator: 'post_generation',
+  image_mix: 'image_mix',
+  image_to_video: 'image_to_video',
+  voice_clone: 'sensitive_media',
+  lip_sync: 'sensitive_media',
+  face_swap: 'sensitive_media',
+  avatar: 'sensitive_media',
+  avatar_video: 'sensitive_media',
+};
+
+const capabilityDisplayLabels = {
+  generate: '自動生成',
+  image_generation: '圖片生成',
+  image_editing: '圖片編修',
+  post_generation: '貼文生成',
+  image_mix: '圖片混合',
+  image_to_video: '圖生影片',
+  sensitive_media: '需同意的私密媒體',
+};
+
+function capabilityForTool(toolType) {
+  return toolCapabilityMap[toolType] || 'generate';
+}
 
 const statusLabels = {
   pending: '等待中',
@@ -218,7 +260,7 @@ function TrialBanner({ bootstrap }) {
   if (!bootstrap?.trialMode?.enabled) return null;
   return (
     <div className="border-b border-yellow-300 bg-yellow-100 px-4 py-2 text-center text-sm font-black text-neutral-950">
-      Testing only: {bootstrap.trialMode.message || '目前為測試站，資料與圖片可能會被清理。'}
+      測試模式：{bootstrap.trialMode.message || '目前為測試站，資料與圖片可能會被清理。'}
     </div>
   );
 }
@@ -347,13 +389,20 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
   const [notice, setNotice] = useState('');
   const [targetLanguage, setTargetLanguage] = useState('en');
   const [watermarkOpacity, setWatermarkOpacity] = useState(40);
+  const [toolConfig, setToolConfig] = useState(savedDraft.toolConfig || {
+    channel: 'instagram',
+    tone: 'conversion',
+    duration_seconds: 5,
+    motion: 'slow product orbit',
+    consent_granted: false,
+    consent_statement: '',
+  });
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [advanced, setAdvanced] = useState(savedDraft.advanced || {
-    provider: '',
-    model: '',
-    capability: 'generate',
-    strict_provider: false,
-    quality_review_required: false,
+  const [advanced, setAdvanced] = useState({
+    provider: savedDraft.advanced?.provider || '',
+    model: savedDraft.advanced?.model || '',
+    strict_provider: Boolean(savedDraft.advanced?.strict_provider),
+    quality_review_required: Boolean(savedDraft.advanced?.quality_review_required),
   });
 
   const stylePresets = bootstrap.stylePresets || [];
@@ -377,10 +426,11 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
         quantity,
         selectedFormatIds,
         customFormats,
+        toolConfig,
         advanced,
       }),
     );
-  }, [toolType, form, styleKey, textMode, titleStyle, subtitleStyle, language, logoMode, imageSize, quantity, selectedFormatIds, customFormats, advanced]);
+  }, [toolType, form, styleKey, textMode, titleStyle, subtitleStyle, language, logoMode, imageSize, quantity, selectedFormatIds, customFormats, toolConfig, advanced]);
 
   useEffect(() => {
     if (currentStyle) {
@@ -400,7 +450,13 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
   const creditCost =
     toolType === 'banner'
       ? files.length * selectedFormatCount * quantity * (imageSize === '4K' ? 30 : 15)
-      : files.length;
+      : toolType === 'post_generator'
+        ? 2
+        : toolType === 'image_to_video'
+          ? Math.max(files.length, 1) * 40
+          : sensitiveToolTypes.includes(toolType)
+            ? Math.max(files.length, 1) * 50
+            : Math.max(files.length, 1) * 12;
 
   const addFiles = (incoming) => {
     const next = [...files];
@@ -480,9 +536,13 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
       data.append('quantity', String(quantity));
       data.append('provider', advanced.provider || '');
       data.append('model', advanced.model || '');
-      data.append('capability', advanced.capability || 'generate');
+      data.append('capability', capabilityForTool(toolType));
       data.append('strict_provider', advanced.strict_provider ? 'true' : 'false');
       data.append('quality_review_required', advanced.quality_review_required ? 'true' : 'false');
+      data.append('metadata_json', JSON.stringify(toolConfig));
+      data.append('privacy_mode', sensitiveToolTypes.includes(toolType) ? 'private' : 'private');
+      data.append('consent_granted', toolConfig.consent_granted ? 'true' : 'false');
+      data.append('consent_statement', toolConfig.consent_statement || '');
       data.append('input_roles', JSON.stringify(files.map((item) => item.role)));
       data.append('platform_format_ids', JSON.stringify(selectedFormatIds));
       data.append('custom_formats', JSON.stringify(customFormats.map((item) => ({ width: item.width, height: item.height }))));
@@ -518,19 +578,19 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
     <main className="mx-auto max-w-7xl px-4 py-8">
       <section className="grid gap-6 lg:grid-cols-[0.9fr_1.1fr]">
         <div className="min-w-0">
-          <p className="text-xs font-black tracking-[0.28em] text-yellow-600">AI-POWERED DESIGN TOOL</p>
+          <p className="text-xs font-black tracking-[0.28em] text-yellow-600">AI 內容設計工具</p>
           <h1 className="mt-3 max-w-3xl text-4xl font-black leading-tight text-neutral-950 sm:text-5xl">
-            AI commerce ad generator for product images and banners
+            AI 商務廣告與商品內容生成平台
           </h1>
           <p className="mt-4 max-w-2xl text-base leading-7 text-neutral-600">
-            Upload product images, analyze copy, create multi-platform campaign assets, and manage outputs from one workflow.
+            上傳商品圖片、分析文案、建立多平台素材，並在同一套任務與素材庫流程中管理生成結果。
           </p>
           <div className="mt-5 grid gap-3 sm:grid-cols-2">
             {[
-              ['Product Analysis', 'AI-assisted product copy and image role suggestions.'],
-              ['Multi-format Banners', 'Generate 1:1, 4:5, 9:16, 16:9, and 1200x628 assets.'],
-              ['Asset Library', 'Search, download, tag, favorite, and export generated assets.'],
-              ['DevPilot Handoff', 'Use source-scoped external keys and toolbox resources safely.'],
+              ['商品分析', 'AI 輔助產生商品文案與圖片角色建議。'],
+              ['多尺寸廣告圖', '支援 1:1、4:5、9:16、16:9 與 1200x628 等素材。'],
+              ['作品素材庫', '搜尋、下載、標籤、收藏並匯出生成素材。'],
+              ['DevPilot 交接', '安全使用來源限定外部金鑰與整合工具資源。'],
             ].map(([title, text]) => (
               <div key={title} className="rounded-lg border border-neutral-200 bg-white p-3">
                 <div className="font-black text-neutral-950">{title}</div>
@@ -539,8 +599,8 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
             ))}
           </div>
           <div className="mt-5 flex flex-wrap gap-3">
-            <button className="btn btn-yellow" onClick={() => (user ? navigate('/dashboard') : openAuth('login'))}>{user ? 'Open Dashboard' : 'Login to Start'}</button>
-            <button className="btn btn-ghost" onClick={() => navigate('/assets')}>Open Assets</button>
+            <button className="btn btn-yellow" onClick={() => (user ? navigate('/dashboard') : openAuth('login'))}>{user ? '開啟儀表板' : '登入開始使用'}</button>
+            <button className="btn btn-ghost" onClick={() => navigate('/assets')}>開啟素材庫</button>
           </div>
         </div>
         <div className="panel">
@@ -554,7 +614,7 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
                 }`}
               >
                 <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-neutral-950 text-white">
-                  {tool.key === 'banner' ? <Sparkles className="h-4 w-4" /> : <ImageIcon className="h-4 w-4" />}
+                  {tool.key === 'post_generator' ? <FileText className="h-4 w-4" /> : tool.key === 'image_mix' ? <Layers className="h-4 w-4" /> : tool.key === 'image_to_video' ? <Video className="h-4 w-4" /> : tool.key === 'banner' ? <Sparkles className="h-4 w-4" /> : <ImageIcon className="h-4 w-4" />}
                 </div>
                 <div className="text-sm font-black">{tool.name}</div>
                 <div className="mt-1 line-clamp-2 text-xs text-neutral-500">{tool.description}</div>
@@ -615,7 +675,15 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
               />
             </>
           ) : (
-            <SimpleToolPanel toolType={toolType} targetLanguage={targetLanguage} setTargetLanguage={setTargetLanguage} />
+            <SimpleToolPanel
+              toolType={toolType}
+              form={form}
+              setForm={setForm}
+              targetLanguage={targetLanguage}
+              setTargetLanguage={setTargetLanguage}
+              toolConfig={toolConfig}
+              setToolConfig={setToolConfig}
+            />
           )}
         </div>
 
@@ -634,49 +702,50 @@ function HomePage({ bootstrap, user, navigate, openAuth, refreshSession }) {
           </div>
           <div className="mt-4 space-y-2 text-sm text-neutral-600">
             <Row label="工具" value={toolLabels[toolType]} />
+            <Row label="AI 工作" value={capabilityDisplayLabels[capabilityForTool(toolType)] || '自動配對'} />
             <Row label="圖片" value={`${files.length} 張`} />
             {toolType === 'banner' && <Row label="尺寸" value={`${selectedFormatCount} 個`} />}
             {toolType === 'banner' && <Row label="解析度" value={imageSize} />}
             {toolType === 'banner' && <Row label="每張產出" value={`${quantity} 張`} />}
+            {toolType === 'post_generator' && <Row label="發佈渠道" value={toolConfig.channel} />}
+            {toolType === 'image_to_video' && <Row label="影片長度" value={`${toolConfig.duration_seconds || 5}s`} />}
+            {sensitiveToolTypes.includes(toolType) && <Row label="隱私" value="私密 + 稽核" />}
           </div>
           <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
             <button type="button" className="flex w-full items-center justify-between text-sm font-black" onClick={() => setAdvancedOpen(!advancedOpen)}>
-              <span>Advanced Options</span>
+              <span>進階設定</span>
               <SlidersHorizontal className="h-4 w-4" />
             </button>
             {advancedOpen && (
               <div className="mt-3 space-y-3 text-sm">
                 <label className="block">
-                  <span className="label">Provider</span>
+                  <span className="label">AI 供應商</span>
                   <select className="field" value={advanced.provider} onChange={(e) => {
                     const provider = (bootstrap.providers || []).find((item) => item.name === e.target.value);
                     setAdvanced({ ...advanced, provider: e.target.value, model: provider?.models?.[0] || '' });
                   }}>
-                    <option value="">Use server default</option>
+                    <option value="">使用伺服器預設</option>
                     {(bootstrap.providers || []).map((provider) => (
                       <option key={provider.name} value={provider.name}>{provider.label || provider.name}</option>
                     ))}
                   </select>
                 </label>
                 <label className="block">
-                  <span className="label">Model</span>
-                  <input className="field" value={advanced.model} onChange={(e) => setAdvanced({ ...advanced, model: e.target.value })} placeholder="Optional model override" />
+                  <span className="label">模型</span>
+                  <input className="field" value={advanced.model} onChange={(e) => setAdvanced({ ...advanced, model: e.target.value })} placeholder="可選填指定模型" />
                 </label>
-                <label className="block">
-                  <span className="label">Capability</span>
-                  <select className="field" value={advanced.capability} onChange={(e) => setAdvanced({ ...advanced, capability: e.target.value })}>
-                    {['generate', 'image_generation', 'image_editing', 'summary', 'classification', 'rewrite', 'extraction', 'planning'].map((item) => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </label>
+                <div className="rounded-lg border border-neutral-200 bg-white p-3">
+                  <div className="label">AI 工作自動配對</div>
+                  <div className="mt-1 font-black text-neutral-950">{capabilityDisplayLabels[capabilityForTool(toolType)] || '自動配對'}</div>
+                  <div className="mt-1 text-xs leading-5 text-neutral-500">依目前工具自動送出，使用者不需要選 technical capability。</div>
+                </div>
                 <label className="flex items-center gap-2 text-xs font-bold text-neutral-600">
                   <input type="checkbox" checked={advanced.strict_provider} onChange={(e) => setAdvanced({ ...advanced, strict_provider: e.target.checked })} />
-                  Strict provider, no fake fallback
+                  嚴格使用指定供應商，不使用 fake fallback
                 </label>
                 <label className="flex items-center gap-2 text-xs font-bold text-neutral-600">
                   <input type="checkbox" checked={advanced.quality_review_required} onChange={(e) => setAdvanced({ ...advanced, quality_review_required: e.target.checked })} />
-                  Require quality review
+                  需要品質審核
                 </label>
               </div>
             )}
@@ -1081,10 +1150,23 @@ function FormatPicker({ formats, category, setCategory, platform, setPlatform, s
   );
 }
 
-function SimpleToolPanel({ toolType, targetLanguage, setTargetLanguage }) {
+function SimpleToolPanel({ toolType, form, setForm, targetLanguage, setTargetLanguage, toolConfig, setToolConfig }) {
+  const sensitive = sensitiveToolTypes.includes(toolType);
   return (
     <section className="panel">
-      <h2 className="text-lg font-black">{toolLabels[toolType]}</h2>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 className="text-lg font-black">{toolLabels[toolType]}</h2>
+        {(toolType === 'post_generator' || sensitive) && <span className="rounded-full bg-neutral-100 px-3 py-1 text-xs font-black">任務 + 點數帳本</span>}
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        <Field label="商品 / 主體" value={form.product_name} onChange={(value) => setForm({ ...form, product_name: value })} />
+        <Field label="活動主標" value={form.main_title} onChange={(value) => setForm({ ...form, main_title: value })} />
+        <Field label="CTA / 副標" value={form.subtitle} onChange={(value) => setForm({ ...form, subtitle: value })} />
+        <div>
+          <label className="label">提示詞備註</label>
+          <textarea className="field min-h-24" value={form.custom_prompt} onChange={(e) => setForm({ ...form, custom_prompt: e.target.value })} />
+        </div>
+      </div>
       {toolType === 'translation' && (
         <div className="mt-3">
           <label className="label">目標語言</label>
@@ -1096,7 +1178,52 @@ function SimpleToolPanel({ toolType, targetLanguage, setTargetLanguage }) {
           </select>
         </div>
       )}
-      <p className="mt-3 text-sm text-neutral-500">此工具第一版先保留入口與資料結構，送出後由 FakeAIProvider 複製輸入圖作為假結果。</p>
+      {toolType === 'post_generator' && (
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <div>
+            <label className="label">發佈渠道</label>
+            <select className="field" value={toolConfig.channel} onChange={(e) => setToolConfig({ ...toolConfig, channel: e.target.value })}>
+              {['instagram', 'facebook', 'line', 'threads', 'tiktok', 'blog'].map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="label">語氣</label>
+            <select className="field" value={toolConfig.tone} onChange={(e) => setToolConfig({ ...toolConfig, tone: e.target.value })}>
+              {[
+                ['conversion', '轉換導向'],
+                ['friendly', '親切'],
+                ['premium', '高級感'],
+                ['educational', '教育說明'],
+                ['playful', '活潑'],
+              ].map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </div>
+        </div>
+      )}
+      {toolType === 'image_to_video' && (
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <div>
+            <label className="label">影片秒數</label>
+            <input className="field" type="number" min="3" max="15" value={toolConfig.duration_seconds} onChange={(e) => setToolConfig({ ...toolConfig, duration_seconds: Number(e.target.value) })} />
+          </div>
+          <Field label="動態描述" value={toolConfig.motion} onChange={(value) => setToolConfig({ ...toolConfig, motion: value })} />
+        </div>
+      )}
+      {sensitive && (
+        <div className="mt-4 rounded-lg border border-yellow-200 bg-yellow-50 p-3">
+          <label className="flex items-start gap-2 text-sm font-bold text-neutral-800">
+            <input type="checkbox" className="mt-1" checked={toolConfig.consent_granted} onChange={(e) => setToolConfig({ ...toolConfig, consent_granted: e.target.checked })} />
+            <span>我已取得主體本人或權利人的明確同意。結果會預設私密保存，並記錄稽核事件。</span>
+          </label>
+          <textarea
+            className="field mt-3 min-h-20"
+            placeholder="同意紀錄、肖像/聲音授權、或內部核准編號"
+            value={toolConfig.consent_statement}
+            onChange={(e) => setToolConfig({ ...toolConfig, consent_statement: e.target.value })}
+          />
+        </div>
+      )}
+      <p className="mt-3 text-sm text-neutral-500">所有生成請求都會建立佇列任務，並透過點數帳本扣點。測試模式下 fake provider 會回傳可預期的本機結果。</p>
     </section>
   );
 }
@@ -1307,7 +1434,7 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
           {latestCostLog && (
             <div className="mt-4 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-sm">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-bold text-neutral-600">AI Provider</span>
+                <span className="font-bold text-neutral-600">AI 供應商</span>
                 <span className="font-black text-neutral-900">
                   {latestCostMeta.provider || '-'} / {latestCostMeta.model || '-'}
                 </span>
@@ -1318,14 +1445,14 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
                 {latestCostMeta.latencyMs !== null && <span>Latency: {latestCostMeta.latencyMs}ms</span>}
                 {latestCostMeta.imageMode && <span>Mode: {latestCostMeta.imageMode}</span>}
                 {latestCostMeta.storageDisk && <span>Storage: {latestCostMeta.storageDisk}</span>}
-                <span>Reference: {latestCostMeta.usedReferenceImage ? 'yes' : 'no'}</span>
-                {(latestCostMeta.requestedProvider || task.requested_provider) && <span>Requested: {latestCostMeta.requestedProvider || task.requested_provider}</span>}
-                {(latestCostMeta.resolvedProvider || task.resolved_provider) && <span>Resolved: {latestCostMeta.resolvedProvider || task.resolved_provider}</span>}
-                {(latestCostMeta.requestedCapability || task.requested_capability) && <span>Capability: {latestCostMeta.requestedCapability || task.requested_capability}</span>}
+                <span>參考圖: {latestCostMeta.usedReferenceImage ? '是' : '否'}</span>
+                {(latestCostMeta.requestedProvider || task.requested_provider) && <span>指定: {latestCostMeta.requestedProvider || task.requested_provider}</span>}
+                {(latestCostMeta.resolvedProvider || task.resolved_provider) && <span>實際: {latestCostMeta.resolvedProvider || task.resolved_provider}</span>}
+                {(latestCostMeta.requestedCapability || task.requested_capability) && <span>能力: {latestCostMeta.requestedCapability || task.requested_capability}</span>}
               </div>
               {latestCostMeta.fallbackUsed && (
                 <div className="mt-2 rounded-full bg-yellow-100 px-3 py-1 text-xs font-black text-yellow-700">
-                  Fallback fake provider{latestCostMeta.fallbackReason ? `: ${latestCostMeta.fallbackReason}` : ''}
+                  已 fallback 到 fake provider{latestCostMeta.fallbackReason ? `: ${latestCostMeta.fallbackReason}` : ''}
                 </div>
               )}
               {(latestCostMeta.qualityReviewRequired || task.quality_review_required) && (
@@ -1342,7 +1469,7 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
               {latestCostMeta.errorMessage && task.status === 'failed' && (
                 <div className="mt-2 text-xs font-bold text-red-600">
                   {latestCostMeta.errorCode && <span>[{latestCostMeta.errorCode}] </span>}
-                  {shortTaskError(latestCostMeta)}
+                  {friendlyTaskError(latestCostMeta)}
                 </div>
               )}
             </div>
@@ -1357,27 +1484,28 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
           {task.status === 'failed' && (
             <div className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">
               <div className="font-bold">錯誤原因</div>
-              <div>{task.error_message || '未知錯誤'}</div>
+              <div>{friendlyTaskError(latestCostMeta, task.error_message || '未知錯誤')}</div>
               <button onClick={retryTask} className="btn btn-ghost mt-3 gap-2"><RefreshCcw className="h-4 w-4" />Retry failed task</button>
             </div>
           )}
         </aside>
         {task.status === 'failed' && (
-          <div className="mt-3 rounded-lg bg-red-100 p-3 text-xs font-bold text-red-700">
-            {latestCostMeta.errorCode && <div>error_code: {latestCostMeta.errorCode}</div>}
-            <div>{shortTaskError(latestCostMeta, task.error_message || '')}</div>
-            <div className="mt-1 font-semibold">請使用 smoke/storage check 與 Admin 任務紀錄排查 provider、worker 或 storage 設定。</div>
-          </div>
+        <div className="mt-3 rounded-lg bg-red-100 p-3 text-xs font-bold text-red-700">
+          {latestCostMeta.errorCode && <div>error_code: {latestCostMeta.errorCode}</div>}
+          <div>{friendlyTaskError(latestCostMeta, task.error_message || '')}</div>
+          <div className="mt-1 font-semibold">請使用 smoke/storage check 與 Admin 任務紀錄排查 provider、worker 或 storage 設定。</div>
+        </div>
         )}
         <section className="min-w-0">
           {task.status === 'success' && (
             <>
               <div className="mb-4 flex flex-wrap gap-2">
-                <button className="btn btn-ghost gap-2" onClick={duplicateTask}><Copy className="h-4 w-4" />Duplicate task</button>
-                <button className="btn btn-ghost gap-2" onClick={requestQuality}><CheckCircle2 className="h-4 w-4" />Request quality review</button>
-                <button className="btn btn-ghost gap-2" onClick={requestHandoff}><Shield className="h-4 w-4" />Request DevPilot handoff</button>
-                <button className="btn btn-ghost gap-2" onClick={() => navigate(`/feedback?task_id=${task.id}`)}><AlertTriangle className="h-4 w-4" />Report issue</button>
+                <button className="btn btn-ghost gap-2" onClick={duplicateTask}><Copy className="h-4 w-4" />複製任務</button>
+                <button className="btn btn-ghost gap-2" onClick={requestQuality}><CheckCircle2 className="h-4 w-4" />申請品質審核</button>
+                <button className="btn btn-ghost gap-2" onClick={requestHandoff}><Shield className="h-4 w-4" />申請 DevPilot 交接</button>
+                <button className="btn btn-ghost gap-2" onClick={() => navigate(`/feedback?task_id=${task.id}`)}><AlertTriangle className="h-4 w-4" />回報問題</button>
               </div>
+              {task.artifacts?.length > 0 && <ArtifactPanel artifacts={task.artifacts} />}
               <ImageGrid
                 images={task.output_images}
                 onRegenerate={regenerateOutput}
@@ -1386,10 +1514,35 @@ function TaskDetailPage({ taskId, navigate, user, openAuth }) {
               />
             </>
           )}
-          {task.status !== 'success' && <ImageGrid images={task.input_images} title="上傳原圖" />}
+          {task.status !== 'success' && (
+            <>
+              {task.artifacts?.length > 0 && <ArtifactPanel artifacts={task.artifacts} />}
+              <ImageGrid images={task.input_images} title="上傳原圖" />
+            </>
+          )}
         </section>
       </div>
     </main>
+  );
+}
+
+function ArtifactPanel({ artifacts }) {
+  return (
+    <div className="panel mb-4">
+      <h2 className="mb-3 text-lg font-black">生成作品</h2>
+      <div className="grid gap-3">
+        {artifacts.map((artifact) => (
+          <div key={artifact.id} className="rounded-lg border border-neutral-200 bg-white p-3">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div className="font-black">{artifact.title || artifact.kind}</div>
+              <span className="rounded-full bg-neutral-100 px-3 py-1 text-xs font-bold">{artifact.kind} / {artifact.visibility || 'private'}</span>
+            </div>
+            {artifact.content_text && <pre className="whitespace-pre-wrap rounded-lg bg-neutral-50 p-3 text-sm leading-6 text-neutral-700">{artifact.content_text}</pre>}
+            {artifact.storage_path && <div className="mt-2 break-all text-xs text-neutral-500">{artifact.storage_path}</div>}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1440,6 +1593,7 @@ function AssetsPage(props) {
   const [provider, setProvider] = useState('all');
   const [format, setFormat] = useState('all');
   const [assets, setAssets] = useState([]);
+  const [artifacts, setArtifacts] = useState([]);
   const [total, setTotal] = useState(0);
   const [message, setMessage] = useState('');
   const [selectedIds, setSelectedIds] = useState([]);
@@ -1454,6 +1608,7 @@ function AssetsPage(props) {
   };
   const load = () => api(`/api/assets?${buildQuery()}`).then((data) => {
     setAssets(data.assets || []);
+    setArtifacts(data.artifacts || []);
     setTotal(data.total || 0);
   });
   useEffect(() => {
@@ -1462,13 +1617,13 @@ function AssetsPage(props) {
   const saveMetadata = async (asset, patch) => {
     const body = { ...(drafts[asset.id] || {}), ...patch };
     await api(`/api/assets/${asset.id}/metadata`, { method: 'POST', body });
-    setMessage('Asset metadata saved.');
+    setMessage('素材資訊已儲存。');
     load();
   };
   const exportManifest = async () => {
     const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
     const result = await api(`/api/assets/export-manifest?ids=${ids.join(',')}`);
-    setMessage(`Manifest ready: ${result.items?.length || 0} items.`);
+    setMessage(`素材清單已產生：${result.items?.length || 0} 筆。`);
     const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -1484,13 +1639,13 @@ function AssetsPage(props) {
   const batchAction = async (action) => {
     const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
     await api('/api/assets/batch', { method: 'POST', body: { ids, action, tags: action === 'tag' ? 'trial-selected' : undefined } });
-    setMessage(`Batch ${action} saved for ${ids.length} assets.`);
+    setMessage(`已批次更新 ${ids.length} 個素材。`);
     load();
   };
   const createShare = async (asset) => {
     const result = await api(`/api/assets/${asset.id}/share`, { method: 'POST', body: {} });
     await navigator.clipboard?.writeText(result.share.share_url);
-    setMessage(`Share link ready: ${result.share.share_url}`);
+    setMessage(`分享連結已建立：${result.share.share_url}`);
     load();
   };
   return (
@@ -1518,6 +1673,7 @@ function AssetsManagerPage(props) {
   const [provider, setProvider] = useState('all');
   const [format, setFormat] = useState('all');
   const [assets, setAssets] = useState([]);
+  const [artifacts, setArtifacts] = useState([]);
   const [total, setTotal] = useState(0);
   const [message, setMessage] = useState('');
   const [selectedIds, setSelectedIds] = useState([]);
@@ -1532,6 +1688,7 @@ function AssetsManagerPage(props) {
   };
   const load = () => api(`/api/assets?${buildQuery()}`).then((data) => {
     setAssets(data.assets || []);
+    setArtifacts(data.artifacts || []);
     setTotal(data.total || 0);
   });
   useEffect(() => {
@@ -1540,13 +1697,13 @@ function AssetsManagerPage(props) {
   const saveMetadata = async (asset, patch) => {
     const body = { ...(drafts[asset.id] || {}), ...patch };
     await api(`/api/assets/${asset.id}/metadata`, { method: 'POST', body });
-    setMessage('Asset metadata saved.');
+    setMessage('素材資訊已儲存。');
     load();
   };
   const exportManifest = async () => {
     const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
     const result = await api(`/api/assets/export-manifest?ids=${ids.join(',')}`);
-    setMessage(`Manifest ready: ${result.items?.length || 0} items.`);
+    setMessage(`素材清單已產生：${result.items?.length || 0} 筆。`);
     const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -1562,23 +1719,23 @@ function AssetsManagerPage(props) {
   const batchAction = async (action) => {
     const ids = selectedIds.length ? selectedIds : assets.map((asset) => asset.id);
     await api('/api/assets/batch', { method: 'POST', body: { ids, action, tags: action === 'tag' ? 'trial-selected' : undefined } });
-    setMessage(`Batch ${action} saved for ${ids.length} assets.`);
+    setMessage(`已批次更新 ${ids.length} 個素材。`);
     load();
   };
   const createShare = async (asset) => {
     const result = await api(`/api/assets/${asset.id}/share`, { method: 'POST', body: {} });
     await navigator.clipboard?.writeText(result.share.share_url);
-    setMessage(`Share link ready: ${result.share.share_url}`);
+    setMessage(`分享連結已建立：${result.share.share_url}`);
     load();
   };
   return (
     <DashboardShell {...props}>
-      <PageTitle title="Assets" subtitle="Generated outputs, metadata, download links, and manifest export." />
+      <PageTitle title="素材庫" subtitle="管理生成作品、素材資訊、下載連結與匯出清單。" />
       <div className="mb-4 flex flex-wrap gap-2">
         {[
-          ['all', 'All'],
-          ['input', 'Inputs'],
-          ['output', 'Outputs'],
+          ['all', '全部'],
+          ['input', '上傳原圖'],
+          ['output', '生成結果'],
         ].map(([key, label]) => (
           <button key={key} onClick={() => setType(key)} className={`rounded-full px-3 py-2 text-sm font-bold ${type === key ? 'bg-neutral-950 text-white' : 'border border-neutral-200 bg-white'}`}>
             {label}
@@ -1586,32 +1743,32 @@ function AssetsManagerPage(props) {
         ))}
       </div>
       <div className="panel mb-4 grid gap-2 md:grid-cols-[1fr_150px_150px_auto_auto_auto]">
-        <input className="field" placeholder="Search product or task id" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()} />
+        <input className="field" placeholder="搜尋商品或任務 ID" value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && load()} />
         <select className="field" value={provider} onChange={(e) => setProvider(e.target.value)}>
-          <option value="all">All providers</option>
+          <option value="all">全部供應商</option>
           <option value="fake">fake</option>
           <option value="openai">openai</option>
           <option value="gemini">gemini</option>
           <option value="claude">claude</option>
         </select>
-        <input className="field" placeholder="Format" value={format === 'all' ? '' : format} onChange={(e) => setFormat(e.target.value || 'all')} />
-        <button className="btn btn-primary gap-2" onClick={load}><Search className="h-4 w-4" />Search</button>
-        <button className="btn btn-ghost gap-2" onClick={exportManifest}><Download className="h-4 w-4" />Manifest</button>
+        <input className="field" placeholder="格式" value={format === 'all' ? '' : format} onChange={(e) => setFormat(e.target.value || 'all')} />
+        <button className="btn btn-primary gap-2" onClick={load}><Search className="h-4 w-4" />搜尋</button>
+        <button className="btn btn-ghost gap-2" onClick={exportManifest}><Download className="h-4 w-4" />清單</button>
         <button className="btn btn-ghost gap-2" onClick={exportCsv}><Download className="h-4 w-4" />CSV</button>
       </div>
       <div className="mb-4 flex flex-wrap gap-2">
-        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('favorite')}>Batch favorite</button>
-        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('archive')}>Batch archive</button>
-        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('tag')}>Batch tag</button>
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('favorite')}>批次收藏</button>
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('archive')}>批次封存</button>
+        <button className="btn btn-ghost px-3 py-1 text-xs" onClick={() => batchAction('tag')}>批次標籤</button>
       </div>
       {message && <div className="mb-4 rounded-lg bg-green-50 p-3 text-sm font-bold text-green-700">{message}</div>}
       <div className="panel">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-lg font-black">Assets ({total})</h2>
-          <span className="text-xs text-neutral-500">{selectedIds.length} selected</span>
+          <h2 className="text-lg font-black">素材 ({total})</h2>
+          <span className="text-xs text-neutral-500">已選 {selectedIds.length} 個</span>
         </div>
         {!assets.length ? (
-          <div className="py-10 text-center text-sm text-neutral-500">No assets yet. Create a fake/local task to populate the library.</div>
+          <div className="py-10 text-center text-sm text-neutral-500">目前沒有素材。建立本機測試任務後會出現在這裡。</div>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {assets.map((asset) => {
@@ -1620,29 +1777,29 @@ function AssetsManagerPage(props) {
                 <div key={asset.id} className="rounded-xl border border-neutral-200 bg-white p-3">
                   <label className="mb-2 flex items-center gap-2 text-xs font-bold text-neutral-500">
                     <input type="checkbox" checked={selectedIds.includes(asset.id)} onChange={(e) => setSelectedIds(e.target.checked ? [...selectedIds, asset.id] : selectedIds.filter((id) => id !== asset.id))} />
-                    #{asset.id} / task #{asset.task_id}
+                    #{asset.id} / 任務 #{asset.task_id}
                   </label>
                   <div className="aspect-square overflow-hidden rounded-lg bg-neutral-100">
                     <img src={asset.url} className="h-full w-full object-cover" alt="" onError={(event) => { event.currentTarget.replaceWith(document.createTextNode(imageLoadErrorMessage())); }} />
                   </div>
                   <div className="mt-3 space-y-1 text-xs text-neutral-600">
-                    <div className="font-black text-neutral-900">{asset.product_name || asset.main_title || 'Untitled'}</div>
-                    <div>{asset.format || 'no format'} / {asset.provider || '-'}</div>
+                    <div className="font-black text-neutral-900">{asset.product_name || asset.main_title || '未命名'}</div>
+                    <div>{asset.format || '未指定格式'} / {asset.provider || '-'}</div>
                     <div>{asset.model || '-'} / cost {asset.cost ?? '-'}</div>
                     <div>{asset.created_at ? new Date(asset.created_at).toLocaleString() : '-'}</div>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <a href={asset.url} download className="btn btn-ghost gap-1 px-2 py-1 text-xs"><Download className="h-3 w-3" />Download</a>
-                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.url)}><Copy className="h-3 w-3" />Copy URL</button>
-                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { favorite: !asset.favorite })}><Heart className="h-3 w-3" />{asset.favorite ? 'Unfavorite' : 'Favorite'}</button>
-                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { archived: true })}>Archive</button>
-                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => createShare(asset)}>Share link</button>
-                    {asset.share_url && <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.share_url)}>Copy share</button>}
+                    <a href={asset.url} download className="btn btn-ghost gap-1 px-2 py-1 text-xs"><Download className="h-3 w-3" />下載</a>
+                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.url)}><Copy className="h-3 w-3" />複製網址</button>
+                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { favorite: !asset.favorite })}><Heart className="h-3 w-3" />{asset.favorite ? '取消收藏' : '收藏'}</button>
+                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => saveMetadata(asset, { archived: true })}>封存</button>
+                    <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => createShare(asset)}>建立分享連結</button>
+                    {asset.share_url && <button className="btn btn-ghost gap-1 px-2 py-1 text-xs" onClick={() => navigator.clipboard?.writeText(asset.share_url)}>複製分享</button>}
                   </div>
                   <div className="mt-3 space-y-2">
-                    <input className="field text-xs" placeholder="tags comma separated" value={draft.tags} onChange={(e) => setDrafts({ ...drafts, [asset.id]: { ...draft, tags: e.target.value } })} />
-                    <textarea className="field min-h-[70px] text-xs" placeholder="notes" value={draft.notes} onChange={(e) => setDrafts({ ...drafts, [asset.id]: { ...draft, notes: e.target.value } })} />
-                    <button className="btn btn-primary w-full px-2 py-1 text-xs" onClick={() => saveMetadata(asset, draft)}>Save tags/notes</button>
+                    <input className="field text-xs" placeholder="標籤，以逗號分隔" value={draft.tags} onChange={(e) => setDrafts({ ...drafts, [asset.id]: { ...draft, tags: e.target.value } })} />
+                    <textarea className="field min-h-[70px] text-xs" placeholder="備註" value={draft.notes} onChange={(e) => setDrafts({ ...drafts, [asset.id]: { ...draft, notes: e.target.value } })} />
+                    <button className="btn btn-primary w-full px-2 py-1 text-xs" onClick={() => saveMetadata(asset, draft)}>儲存標籤/備註</button>
                   </div>
                 </div>
               );
@@ -1650,6 +1807,24 @@ function AssetsManagerPage(props) {
           </div>
         )}
       </div>
+      {!!artifacts.length && (
+        <div className="panel mt-4">
+          <h2 className="mb-3 text-lg font-black">文字 / 影片作品</h2>
+          <div className="grid gap-3 md:grid-cols-2">
+            {artifacts.map((artifact) => (
+              <div key={artifact.id} className="rounded-lg border border-neutral-200 bg-white p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div className="min-w-0 truncate font-black">{artifact.title || artifact.kind}</div>
+                  <span className="shrink-0 rounded-full bg-neutral-100 px-3 py-1 text-xs font-bold">{artifact.kind}</span>
+                </div>
+                <div className="mb-2 text-xs text-neutral-500">任務 #{artifact.task_id} / {toolLabels[artifact.tool_type] || artifact.tool_type} / {artifact.visibility === 'private' ? '私密' : '分享'}</div>
+                {artifact.content_text && <pre className="max-h-44 overflow-auto whitespace-pre-wrap rounded bg-neutral-50 p-3 text-xs leading-5">{artifact.content_text}</pre>}
+                {artifact.url && <a className="btn btn-ghost mt-2 px-2 py-1 text-xs" href={artifact.url}>開啟檔案</a>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </DashboardShell>
   );
 }
@@ -1722,6 +1897,12 @@ function BrandPage(props) {
           <div><label className="label">預設浮水印</label><input className="field" type="file" name="watermark" accept=".jpg,.jpeg,.png,.webp,.bmp" /></div>
           <div><label className="label">預設語言</label><select className="field" name="default_language" value={settings.default_language} onChange={(e) => setSettings({ ...settings, default_language: e.target.value })}><option value="zh-TW">繁中</option><option value="en">英文</option></select></div>
           <div><label className="label">預設 Logo 模式</label><select className="field" name="default_logo_mode" value={settings.default_logo_mode} onChange={(e) => setSettings({ ...settings, default_logo_mode: e.target.value })}><option value="keep">完整展示</option><option value="remove">遮蔽去除</option></select></div>
+          <div><label className="label">Brand voice</label><input className="field" name="brand_voice" value={settings.brand_voice || ''} onChange={(e) => setSettings({ ...settings, brand_voice: e.target.value })} /></div>
+          <div><label className="label">Target audience</label><input className="field" name="target_audience" value={settings.target_audience || ''} onChange={(e) => setSettings({ ...settings, target_audience: e.target.value })} /></div>
+          <div><label className="label">Keywords</label><textarea className="field min-h-24" name="brand_keywords" value={settings.brand_keywords || ''} onChange={(e) => setSettings({ ...settings, brand_keywords: e.target.value })} /></div>
+          <div><label className="label">Forbidden terms</label><textarea className="field min-h-24" name="forbidden_terms" value={settings.forbidden_terms || ''} onChange={(e) => setSettings({ ...settings, forbidden_terms: e.target.value })} /></div>
+          <div><label className="label">Product pillars</label><textarea className="field min-h-24" name="product_pillars" value={settings.product_pillars || ''} onChange={(e) => setSettings({ ...settings, product_pillars: e.target.value })} /></div>
+          <div><label className="label">Sample posts</label><textarea className="field min-h-24" name="sample_posts" value={settings.sample_posts || ''} onChange={(e) => setSettings({ ...settings, sample_posts: e.target.value })} /></div>
           <input type="hidden" name="brand_name" value={settings.brand_name || ''} />
           <input type="hidden" name="primary_color" value={settings.primary_color || ''} />
           <input type="hidden" name="secondary_color" value={settings.secondary_color || ''} />
@@ -2492,8 +2673,14 @@ function AdminIntegrationToolboxPage(props) {
 
 function AdminProvidersPage(props) {
   const [data, setData] = useState(null);
+  const [matrix, setMatrix] = useState(null);
   const [ping, setPing] = useState({});
-  useEffect(() => { api('/api/admin/providers').then(setData); }, []);
+  useEffect(() => {
+    Promise.all([api('/api/admin/providers'), api('/api/admin/provider-capability-matrix')]).then(([providersData, matrixData]) => {
+      setData(providersData);
+      setMatrix(matrixData);
+    });
+  }, []);
   const runPing = async (provider) => {
     const result = await api(`/api/admin/providers/${provider}/ping`, { method: 'POST', body: { live: false } });
     setPing((current) => ({ ...current, [provider]: result }));
@@ -2502,44 +2689,112 @@ function AdminProvidersPage(props) {
     <AdminShell {...props}>
       <PageTitle title="AI Providers" subtitle="Registry metadata for fake, OpenAI, Gemini, Claude, external, and DevPilot Gateway providers." />
       {!data ? <LoadingPanel /> : (
-        <div className="grid gap-4 md:grid-cols-2">
-          {data.providers?.map((provider) => (
-            <div key={provider.name} className="panel space-y-3">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="text-xl font-black">{provider.label}</div>
-                  <div className="text-xs text-neutral-500">{provider.name}</div>
+        <div className="space-y-5">
+          <div className="grid gap-4 md:grid-cols-2">
+            {data.providers?.map((provider) => (
+              <div key={provider.name} className="panel space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xl font-black">{provider.label}</div>
+                    <div className="text-xs text-neutral-500">{provider.name}</div>
+                  </div>
+                  <span className={`rounded-full px-3 py-1 text-xs font-black ${provider.configured ? 'bg-green-100 text-green-700' : 'bg-neutral-100 text-neutral-600'}`}>
+                    {provider.configured ? 'configured' : 'not configured'}
+                  </span>
                 </div>
-                <span className={`rounded-full px-3 py-1 text-xs font-black ${provider.configured ? 'bg-green-100 text-green-700' : 'bg-neutral-100 text-neutral-600'}`}>
-                  {provider.configured ? 'configured' : 'not configured'}
-                </span>
-              </div>
-              <div className="grid gap-2 text-sm sm:grid-cols-2">
-                <Row label="Source" value={provider.source || '-'} />
-                <Row label="Key" value={provider.keyConfigured ? 'configured' : 'missing'} />
-                <Row label="Text" value={provider.supportsTextGeneration ? 'yes' : 'no'} />
-                <Row label="Image generation" value={provider.supportsImageGeneration ? 'yes' : 'fallback/scaffold'} />
-              </div>
-              <div className="text-xs text-neutral-500">Models: {(provider.models || []).join(', ') || '-'}</div>
-              <div className="flex flex-wrap gap-1">
-                {(provider.capabilities || []).map((capability) => <span key={capability} className="rounded-full bg-neutral-100 px-2 py-1 text-xs">{capability}</span>)}
-              </div>
-              <button className="btn btn-ghost px-3 py-1" onClick={() => runPing(provider.name)}>Config ping</button>
-              {ping[provider.name] && <pre className="max-h-48 overflow-auto rounded-lg bg-neutral-950 p-3 text-xs text-neutral-100">{JSON.stringify(ping[provider.name], null, 2)}</pre>}
-              {data.lastPing?.provider === provider.name && (
-                <div className={`rounded-lg p-3 text-xs ${data.lastPing.ok ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
-                  <div className="font-black">Last live ping: {data.lastPing.ok ? 'ok' : 'failed'}</div>
-                  <div>Diagnosis: {data.lastPing.diagnosis?.code || '-'}</div>
-                  <div>Latency: {data.lastPing.latency_ms ?? '-'}ms</div>
-                  <div>Usage: {JSON.stringify(data.lastPing.usage || {})}</div>
-                  {data.lastPing.output && <div className="mt-1 line-clamp-3">Output: {data.lastPing.output}</div>}
+                <div className="grid gap-2 text-sm sm:grid-cols-2">
+                  <Row label="Source" value={provider.source || '-'} />
+                  <Row label="Key" value={provider.keyConfigured ? 'configured' : 'missing'} />
+                  <Row label="Text" value={provider.supportsTextGeneration ? 'yes' : 'no'} />
+                  <Row label="Image generation" value={provider.supportsImageGeneration ? 'yes' : 'fallback/scaffold'} />
                 </div>
-              )}
-            </div>
-          ))}
+                <div className="text-xs text-neutral-500">Models: {(provider.models || []).join(', ') || '-'}</div>
+                <div className="flex flex-wrap gap-1">
+                  {(provider.capabilities || []).map((capability) => <span key={capability} className="rounded-full bg-neutral-100 px-2 py-1 text-xs">{capability}</span>)}
+                </div>
+                <button className="btn btn-ghost px-3 py-1" onClick={() => runPing(provider.name)}>Config ping</button>
+                {ping[provider.name] && <pre className="max-h-48 overflow-auto rounded-lg bg-neutral-950 p-3 text-xs text-neutral-100">{JSON.stringify(ping[provider.name], null, 2)}</pre>}
+                {data.lastPing?.provider === provider.name && (
+                  <div className={`rounded-lg p-3 text-xs ${data.lastPing.ok ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
+                    <div className="font-black">Last live ping: {data.lastPing.ok ? 'ok' : 'failed'}</div>
+                    <div>Diagnosis: {data.lastPing.diagnosis?.code || '-'}</div>
+                    <div>Latency: {data.lastPing.latency_ms ?? '-'}ms</div>
+                    <div>Usage: {JSON.stringify(data.lastPing.usage || {})}</div>
+                    {data.lastPing.output && <div className="mt-1 line-clamp-3">Output: {data.lastPing.output}</div>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {matrix && <ProviderCapabilityMatrix matrix={matrix} />}
         </div>
       )}
     </AdminShell>
+  );
+}
+
+function ProviderCapabilityMatrix({ matrix }) {
+  return (
+    <div className="panel overflow-x-auto">
+      <div className="mb-4">
+        <h2 className="text-xl font-black">工具與供應商支援狀態</h2>
+        <p className="mt-1 text-sm text-neutral-500">依 provider registry 產生；fake 只代表開發測試 placeholder。</p>
+      </div>
+      <table className="w-full min-w-[920px] text-left text-sm">
+        <thead className="text-xs text-neutral-500">
+          <tr>
+            <th className="py-2">工具</th>
+            <th>必要能力</th>
+            <th>可用供應商</th>
+            <th>限制 / 備註</th>
+          </tr>
+        </thead>
+        <tbody>
+          {(matrix.tools || []).map((tool) => {
+            const supported = (tool.providers || []).filter((provider) => provider.supported);
+            const notes = [
+              tool.notes,
+              tool.consent_required ? '需 consent' : '',
+              tool.private_by_default ? 'private-by-default' : '',
+            ].filter(Boolean);
+            return (
+              <tr key={tool.tool_type} className="border-t border-neutral-100 align-top">
+                <td className="py-3">
+                  <div className="font-black text-neutral-950">{tool.label}</div>
+                  <div className="font-mono text-xs text-neutral-500">{tool.tool_type}</div>
+                </td>
+                <td className="py-3 font-mono text-xs">{tool.required_capability}</td>
+                <td className="py-3">
+                  <div className="flex max-w-xl flex-wrap gap-1">
+                    {supported.map((provider) => (
+                      <span
+                        key={provider.name}
+                        className={`rounded-full px-2 py-1 text-xs font-black ${
+                          provider.fake_only
+                            ? 'bg-yellow-100 text-yellow-800'
+                            : provider.live
+                              ? 'bg-green-100 text-green-700'
+                              : 'bg-neutral-100 text-neutral-600'
+                        }`}
+                      >
+                        {provider.label}{provider.fake_only ? ' (dev only)' : provider.live ? '' : ' (needs config)'}
+                      </span>
+                    ))}
+                    {!supported.length && <span className="text-xs text-red-600">尚無 provider</span>}
+                  </div>
+                </td>
+                <td className="py-3 text-xs leading-5 text-neutral-600">
+                  <div>{notes.join(' / ') || '-'}</div>
+                  <div className="mt-1 text-neutral-400">
+                    不支援：{(tool.providers || []).filter((provider) => !provider.supported).map((provider) => provider.label).join(', ') || '-'}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -2961,7 +3216,7 @@ function SharePage({ token }) {
   useEffect(() => {
     api(`/api/share/${encodeURIComponent(token)}`).then((data) => setAsset(data.asset)).catch((err) => setError(err.message));
   }, [token]);
-  if (error) return <main className="mx-auto max-w-xl px-4 py-16"><div className="panel"><h1 className="text-xl font-black">Share link not found</h1><p className="mt-2 text-sm text-neutral-600">這個分享連結不存在、已撤銷，或圖片已被清理。</p></div></main>;
+  if (error) return <main className="mx-auto max-w-xl px-4 py-16"><div className="panel"><h1 className="text-xl font-black">找不到分享連結</h1><p className="mt-2 text-sm text-neutral-600">這個分享連結不存在、已撤銷，或圖片已被清理。</p></div></main>;
   if (!asset) return <main className="mx-auto max-w-xl px-4 py-16"><LoadingPanel /></main>;
   return (
     <main className="mx-auto max-w-4xl px-4 py-8">
@@ -2970,7 +3225,7 @@ function SharePage({ token }) {
         <img src={asset.image_url} className="max-h-[70vh] w-full rounded-lg bg-white object-contain" alt="" onError={() => setImageError(true)} />
         {imageError && <div className="mt-3 rounded-lg bg-yellow-50 p-3 text-sm font-bold text-yellow-700">圖片載入失敗，請稍後重試或回報問題。</div>}
         <div className="mt-4 flex flex-wrap gap-2">
-          <a href={asset.image_url} download className="btn btn-yellow gap-2"><Download className="h-4 w-4" />Download</a>
+          <a href={asset.image_url} download className="btn btn-yellow gap-2"><Download className="h-4 w-4" />下載</a>
           <button className="btn btn-ghost" onClick={() => { window.location.href = `/feedback?asset_url=${encodeURIComponent(asset.image_url)}`; }}>Report image issue</button>
         </div>
         <div className="mt-3 text-sm font-bold text-neutral-500">由 imageai.tw 生成</div>
