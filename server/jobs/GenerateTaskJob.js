@@ -4,6 +4,33 @@ import { config } from '../config/index.js';
 import { resolveAIProvider } from '../services/AIProviderFactory.js';
 import { recordTaskFailure } from '../services/TaskFailurePolicy.js';
 
+function inferOutputFormat(output = {}, runMetadata = {}) {
+  if (runMetadata.output_format) return runMetadata.output_format;
+  if (output.output_format) return output.output_format;
+  const mimeType = String(output.mime_type || '');
+  if (mimeType.includes('/')) return mimeType.split('/').pop();
+  return null;
+}
+
+function buildOutputTrace(output = {}, index = 0, runMetadata = {}) {
+  return {
+    index,
+    storage_path: output.storage_path || null,
+    mime_type: output.mime_type || null,
+    width: output.width || null,
+    height: output.height || null,
+    file_size: output.file_size || null,
+    output_format: inferOutputFormat(output, runMetadata),
+    transparent_background: Boolean(output.transparent_background ?? runMetadata.transparent_background),
+    image_mode: output.image_mode || runMetadata.image_mode || null,
+    used_reference_image: Boolean(output.used_reference_image ?? runMetadata.used_reference_image),
+    requested_width: output.requested_width || null,
+    requested_height: output.requested_height || null,
+    generation_size: output.generation_size || null,
+    postprocess: output.postprocess || null,
+  };
+}
+
 export class GenerateTaskJob {
   static queue = [];
   static working = false;
@@ -81,6 +108,22 @@ export class GenerateTaskJob {
       const selectionFallback = Boolean(freshTask.fallback_reason && freshTask.resolved_provider === 'fake' && freshTask.requested_provider && freshTask.requested_provider !== 'fake');
       const fallbackUsed = Boolean(runMetadata.fallback_from || runMetadata.fallback_used || selectionFallback);
       const fallbackReason = runMetadata.fallback_reason || freshTask.fallback_reason || runMetadata.error || null;
+      const outputTraces = outputs.map((output, index) => buildOutputTrace(output, index, runMetadata));
+      const firstOutput = outputTraces[0] || {};
+      const providerTrace = {
+        requested_provider: freshTask.requested_provider || null,
+        resolved_provider: freshTask.resolved_provider || provider.providerName || null,
+        effective_provider: runMetadata.provider || provider.providerName || 'unknown',
+        requested_model: freshTask.requested_model || null,
+        resolved_model: freshTask.resolved_model || runMetadata.model || provider.modelName || null,
+        effective_model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
+        requested_capability: freshTask.requested_capability || null,
+        provider_config_source: freshTask.provider_config_source || null,
+        provider_selection_reason: freshTask.provider_selection_reason || null,
+        fallback_used: fallbackUsed,
+        fallback_from: runMetadata.fallback_from || null,
+        fallback_reason: fallbackReason,
+      };
 
       outputs.forEach((image, index) => {
         TaskImage.create({
@@ -110,22 +153,29 @@ export class GenerateTaskJob {
           model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
           image_count: loggedImageCount,
           output_type: runMetadata.output_type || (freshTask.tool_type === 'copywriting' ? 'copywriting' : 'image'),
+          output_format: runMetadata.output_format || firstOutput.output_format || null,
+          transparent_background: Boolean(runMetadata.transparent_background || outputTraces.some((output) => output.transparent_background)),
+          outputs: outputTraces,
+          edit_options: runMetadata.edit_options || null,
           usage: runMetadata.usage || null,
           estimated_cost: runMetadata.estimated_cost ?? runMetadata.cost_usd ?? null,
           cost: runMetadata.cost_usd ?? null,
           storage_disk: config.filesystemDisk,
-          image_mode: runMetadata.image_mode || null,
-          used_reference_image: Boolean(runMetadata.used_reference_image),
+          image_mode: runMetadata.image_mode || firstOutput.image_mode || null,
+          used_reference_image: Boolean(runMetadata.used_reference_image || outputTraces.some((output) => output.used_reference_image)),
           fallback_used: fallbackUsed,
           fallback_from: runMetadata.fallback_from || null,
           fallback_reason: fallbackReason,
           requested_provider: freshTask.requested_provider || null,
           resolved_provider: freshTask.resolved_provider || provider.providerName || null,
+          effective_provider: runMetadata.provider || provider.providerName || 'unknown',
           requested_model: freshTask.requested_model || null,
           resolved_model: freshTask.resolved_model || runMetadata.model || provider.modelName || null,
+          effective_model: runMetadata.model || provider.modelName || provider.providerName || 'unknown',
           requested_capability: freshTask.requested_capability || null,
           provider_config_source: freshTask.provider_config_source || null,
           provider_selection_reason: freshTask.provider_selection_reason || null,
+          provider_trace: providerTrace,
           quality_review_required: Boolean(freshTask.quality_review_required),
           latency_ms: latencyMs,
           error_code: runMetadata.error_code || null,
@@ -134,6 +184,8 @@ export class GenerateTaskJob {
             requested_width: image.requested_width || null,
             requested_height: image.requested_height || null,
             generation_size: image.generation_size || null,
+            output_format: image.output_format || runMetadata.output_format || null,
+            transparent_background: Boolean(image.transparent_background ?? runMetadata.transparent_background),
             postprocess: image.postprocess || null,
           })),
           raw: runMetadata.raw_response_json || null,
