@@ -92,6 +92,28 @@ function isRetryableProviderError(error) {
   return error.name === 'AbortError' || error.name === 'TimeoutError' || error instanceof TypeError || status === 429 || status >= 500;
 }
 
+function isProviderSafetyRejection(error = {}) {
+  const code = String(error.code || error.name || '').toLowerCase();
+  const message = String(error.message || '').toLowerCase();
+  const status = Number(error.status || 0);
+  return (
+    status === 400 &&
+      (code.includes('policy') ||
+        code.includes('safety') ||
+        message.includes('safety system') ||
+        message.includes('content policy') ||
+        message.includes('policy violation') ||
+        message.includes('your request was rejected') ||
+        message.includes('request was rejected as a result of our safety system'))
+  );
+}
+
+function markProviderRejection(error) {
+  error.code = error.code || 'provider_rejected';
+  error.retryable = false;
+  return error;
+}
+
 function redactSecret(message = '', secret = '') {
   const text = String(message || '');
   return secret ? text.replaceAll(secret, '[redacted]') : text;
@@ -414,7 +436,7 @@ export class OpenAIProvider extends AIProviderInterface {
         fallbackReason: null,
       };
     } catch (error) {
-      if (config.aiStrictProvider) throw error;
+      if (config.aiStrictProvider || isProviderSafetyRejection(error)) throw markProviderRejection(error);
       return {
         response: await generate(),
         imageMode: 'generate',
@@ -580,7 +602,7 @@ export class OpenAIProvider extends AIProviderInterface {
     try {
       return await callback();
     } catch (error) {
-      if (config.aiStrictProvider) throw error;
+      if (config.aiStrictProvider || isProviderSafetyRejection(error)) throw markProviderRejection(error);
       const result = await this.fallbackProvider[method](...args);
       const metadata = {
         provider: 'fake',
