@@ -332,6 +332,8 @@ export class OpenAIProvider extends AIProviderInterface {
               generation_size: generationSize,
               generated_width: generated.width,
               generated_height: generated.height,
+              output_format: 'png',
+              transparent_background: false,
               postprocess: processed.postprocess,
             });
           }
@@ -346,6 +348,8 @@ export class OpenAIProvider extends AIProviderInterface {
         cost_usd: null,
         image_mode: modeRecords.some((item) => item.image_mode === 'edit') ? 'edit' : 'generate',
         used_reference_image: modeRecords.some((item) => item.used_reference_image),
+        output_format: 'png',
+        transparent_background: false,
         fallback_reason: modeRecords.map((item) => item.fallback_reason).find(Boolean) || null,
         raw_response_json: {
           image_modes: modeRecords,
@@ -353,13 +357,15 @@ export class OpenAIProvider extends AIProviderInterface {
             requested_width: output.requested_width,
             requested_height: output.requested_height,
             generation_size: output.generation_size,
+            output_format: output.output_format,
+            transparent_background: output.transparent_background,
             postprocess: output.postprocess,
           })),
           responses: rawResponses,
         },
       };
 
-    return outputs;
+      return outputs;
     });
   }
 
@@ -427,7 +433,104 @@ export class OpenAIProvider extends AIProviderInterface {
   }
 
   async cutoutImage(task) {
-    return this.fallbackProvider.cutoutImage(task);
+    return this.withFallback('cutoutImage', [task], async () => {
+      const startedAt = Date.now();
+      const freshTask = GenerationTask.find(task.id) || task;
+      const inputs = GenerationTask.images(freshTask.id, 'input');
+      const outputs = [];
+      const rawResponses = [];
+      const usageTotals = {};
+
+      for (let index = 0; index < inputs.length; index += 1) {
+        const input = inputs[index];
+        const generationSize = closestSupportedSize(input.width, input.height);
+        const referenceBuffer = await storageService.read(input.storage_path);
+        const referenceFile = await toFile(referenceBuffer, `task-cutout-${input.id || Date.now()}.png`, {
+          type: input.mime_type || 'image/png',
+        });
+        const response = await this.imagesEdit({
+          model: config.openaiImageModel,
+          image: referenceFile,
+          prompt: [
+            'Remove the background from the uploaded product or subject image.',
+            'Preserve the original subject exactly, including edges, colors, logos, labels, texture, proportions, and shadows when useful.',
+            'Return a clean transparent-background PNG only.',
+          ].join('\n'),
+          size: generationSize,
+          n: 1,
+          background: 'transparent',
+          output_format: 'png',
+          input_fidelity: 'high',
+        });
+
+        rawResponses.push(sanitizeRawResponse(response));
+        mergeUsage(usageTotals, response.usage);
+        const image = response.data?.[0];
+        const buffer = image?.b64_json
+          ? Buffer.from(image.b64_json, 'base64')
+          : await this.fetchImageBuffer(image?.url);
+        const processed = await postProcessImage(buffer, {
+          taskId: freshTask.id,
+          format: {
+            label: 'Smart background removal',
+            requestedWidth: input.width || null,
+            requestedHeight: input.height || null,
+          },
+          index,
+          outputFormat: 'png',
+        });
+        const storagePath = await storageService.putOutput(processed.buffer, processed.filename);
+        const generated = parseSize(generationSize);
+        outputs.push({
+          storage_path: storagePath,
+          width: processed.width,
+          height: processed.height,
+          file_size: processed.file_size,
+          mime_type: processed.mime_type,
+          requested_width: input.width || null,
+          requested_height: input.height || null,
+          generation_size: generationSize,
+          generated_width: generated.width,
+          generated_height: generated.height,
+          output_format: 'png',
+          transparent_background: true,
+          image_mode: 'edit',
+          used_reference_image: true,
+          postprocess: processed.postprocess,
+        });
+      }
+
+      this.lastRunMetadata = {
+        provider: this.providerName,
+        model: config.openaiImageModel,
+        image_count: outputs.length,
+        usage: Object.keys(usageTotals).length ? usageTotals : null,
+        cost_usd: null,
+        latency_ms: Date.now() - startedAt,
+        image_mode: 'edit',
+        used_reference_image: true,
+        output_format: 'png',
+        transparent_background: true,
+        edit_options: {
+          background: 'transparent',
+          output_format: 'png',
+          input_fidelity: 'high',
+        },
+        raw_response_json: {
+          requested: outputs.map((output) => ({
+            requested_width: output.requested_width,
+            requested_height: output.requested_height,
+            generation_size: output.generation_size,
+            output_format: output.output_format,
+            transparent_background: output.transparent_background,
+            postprocess: output.postprocess,
+          })),
+          responses: rawResponses,
+        },
+      };
+
+      return outputs;
+    });
   }
 
   async removeText(task) {
