@@ -3,10 +3,25 @@ import { AiCostLog, GenerationTask } from '../models/index.js';
 import { config } from '../config/index.js';
 import { creditService } from './CreditService.js';
 
+function isPolicyOrSafetyError(code = '', message = '') {
+  const lowerCode = String(code || '').toLowerCase();
+  const lower = String(message || '').toLowerCase();
+  return (
+    lowerCode.includes('policy') ||
+    lowerCode.includes('safety') ||
+    lower.includes('safety system') ||
+    lower.includes('content policy') ||
+    lower.includes('policy violation') ||
+    lower.includes('your request was rejected') ||
+    lower.includes('request was rejected as a result of our safety system')
+  );
+}
+
 export function classifyTaskError(error = {}) {
   const code = error.code || error.name || 'provider_error';
   const message = String(error.message || '');
   const lower = message.toLowerCase();
+  const policyOrSafety = isPolicyOrSafetyError(code, message);
   const retryable =
     error.retryable === true ||
     code === 'storage_error' ||
@@ -17,13 +32,15 @@ export function classifyTaskError(error = {}) {
     lower.includes('timeout');
   const nonRetryable =
     error.retryable === false ||
+    policyOrSafety ||
+    code === 'provider_rejected' ||
     code === 'validation_error' ||
     code === 'configuration_error' ||
     lower.includes('openai_api_key') ||
     lower.includes('invalid api key') ||
     lower.includes('forced failure');
   return {
-    code,
+    code: policyOrSafety && code === 'provider_error' ? 'provider_rejected' : code,
     message,
     retryable: retryable && !nonRetryable,
   };
