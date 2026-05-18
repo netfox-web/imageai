@@ -17,6 +17,7 @@
     "worker": "node server/worker.js",
     "env:check": "node server/cli/env-check.js",
     "smoke:staging": "node server/cli/staging-smoke.js",
+    "smoke:openai-cutout": "node server/cli/openai-cutout-smoke.js",
     "storage:check": "node server/cli/storage-check.js",
     "quality:review": "node server/cli/quality-review.js",
     "tasks:recover": "node server/cli/tasks-recover.js",
